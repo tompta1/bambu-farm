@@ -19,10 +19,50 @@ using tchar = char;
 using Bambu_Tunnel = void *;
 using Logger = void (*)(void *context, int level, tchar const *msg);
 
+enum Bambu_StreamType
+{
+    VIDE,
+    AUDI
+};
+
+enum Bambu_VideoSubType
+{
+    AVC1,
+    MJPG
+};
+
+enum Bambu_AudioSubType
+{
+    MP4A
+};
+
+enum Bambu_FormatType
+{
+    video_avc_packet,
+    video_avc_byte_stream,
+    video_jpeg,
+    audio_raw,
+    audio_adts
+};
+
 struct Bambu_StreamInfo
 {
     int type;
     int sub_type;
+    union {
+        struct
+        {
+            int width;
+            int height;
+            int frame_rate;
+        } video;
+        struct
+        {
+            int sample_rate;
+            int channel_count;
+            int sample_size;
+        } audio;
+    } format;
     int format_type;
     int format_size;
     int max_frame_size;

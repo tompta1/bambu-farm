@@ -4,10 +4,15 @@ use std::env::current_dir;
 use std::env::var_os;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{self, Command};
 use std::sync::Mutex;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::mpsc::{self as std_mpsc, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::thread;
 use std::time::Duration;
 
 use cxx::let_cxx_string;
@@ -47,6 +52,22 @@ use self::ffi::bambu_network_cb_printer_available;
 
 const GRPC_MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
 const UPLOAD_CHUNK_SIZE: usize = 256 * 1024;
+const CAMERA_STREAM_PORT: u16 = 6000;
+const CAMERA_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const CAMERA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const CAMERA_STREAM_ACTIVE: i32 = 0;
+const CAMERA_STREAM_ENDED: i32 = 1;
+const CAMERA_STREAM_ERROR: i32 = -1;
+const CAMERA_QUEUE_DEPTH: usize = 8;
+const CAMERA_AUTH_PREFIX: [u8; 16] = [
+    0x40, 0x00, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+const CAMERA_PACKET_MAGIC: [u8; 12] = [
+    0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+];
 
 pub mod bambu_farm {
     tonic::include_proto!("_");
@@ -121,6 +142,16 @@ lazy_static! {
         Mutex::new(None);
 }
 
+struct CameraStreamHandle {
+    receiver: Receiver<Vec<u8>>,
+    stop: Arc<AtomicBool>,
+    state: Arc<AtomicI32>,
+}
+
+lazy_static! {
+    static ref CAMERA_STREAMS: Mutex<HashMap<u64, CameraStreamHandle>> = Mutex::new(HashMap::new());
+}
+
 #[cxx::bridge]
 mod ffi {
 
@@ -140,6 +171,14 @@ mod ffi {
             device_id: String,
             data: String,
         ) -> Vec<u8>;
+        pub fn bambu_network_rs_start_camera_stream(
+            stream_id: u64,
+            tunnel_url: String,
+            device_id: String,
+        ) -> i32;
+        pub fn bambu_network_rs_read_camera_frame(stream_id: u64) -> Vec<u8>;
+        pub fn bambu_network_rs_camera_stream_state(stream_id: u64) -> i32;
+        pub fn bambu_network_rs_stop_camera_stream(stream_id: u64);
         pub fn bambu_network_rs_extract_3mf_thumbnail(
             local_filename: String,
             plate_index: i32,
@@ -271,6 +310,15 @@ fn ftps_connector() -> Result<NativeTlsConnector, String> {
     Ok(NativeTlsConnector::from(connector))
 }
 
+fn insecure_tls_connector() -> Result<TlsConnector, String> {
+    let mut builder = TlsConnector::builder();
+    builder.danger_accept_invalid_certs(true);
+    builder.danger_accept_invalid_hostnames(true);
+    builder
+        .build()
+        .map_err(|err| format!("failed to build TLS connector: {}", err))
+}
+
 fn finalize_ftps_login(
     mut ftp_stream: NativeTlsFtpStream,
     username: &str,
@@ -326,6 +374,120 @@ fn preview_bytes(bytes: &[u8], limit: usize) -> String {
 
 fn build_error_frame(sequence: i64, result: i64) -> Vec<u8> {
     build_reply_frame(sequence, result, json!({}), &[])
+}
+
+fn build_camera_auth_packet(username: &str, password: &str) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(16 + 32 + 32);
+    packet.extend_from_slice(&CAMERA_AUTH_PREFIX);
+
+    let mut username_bytes = [0u8; 32];
+    let copy_len = username.len().min(username_bytes.len());
+    username_bytes[..copy_len].copy_from_slice(&username.as_bytes()[..copy_len]);
+    packet.extend_from_slice(&username_bytes);
+
+    let mut password_bytes = [0u8; 32];
+    let copy_len = password.len().min(password_bytes.len());
+    password_bytes[..copy_len].copy_from_slice(&password.as_bytes()[..copy_len]);
+    packet.extend_from_slice(&password_bytes);
+
+    packet
+}
+
+fn read_exact_interruptible<R: Read>(
+    reader: &mut R,
+    buf: &mut [u8],
+    stop: &AtomicBool,
+) -> Result<bool, String> {
+    let mut read_total = 0;
+    while read_total < buf.len() {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        match reader.read(&mut buf[read_total..]) {
+            Ok(0) => return Ok(false),
+            Ok(bytes) => read_total += bytes,
+            Err(err) if matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                continue;
+            }
+            Err(err) => return Err(format!("camera read failed: {}", err)),
+        }
+    }
+    Ok(true)
+}
+
+fn camera_stream_worker(
+    host: String,
+    username: String,
+    password: String,
+    stop: Arc<AtomicBool>,
+    state: Arc<AtomicI32>,
+    tx: SyncSender<Vec<u8>>,
+) {
+    let result = (|| -> Result<(), String> {
+        let tcp = TcpStream::connect_timeout(
+            &format!("{}:{}", host, CAMERA_STREAM_PORT)
+                .parse()
+                .map_err(|err| format!("invalid camera socket address: {}", err))?,
+            CAMERA_CONNECT_TIMEOUT,
+        )
+        .map_err(|err| format!("camera TCP connect failed: {}", err))?;
+        tcp.set_read_timeout(Some(CAMERA_READ_TIMEOUT))
+            .map_err(|err| format!("failed to set camera read timeout: {}", err))?;
+        tcp.set_write_timeout(Some(CAMERA_CONNECT_TIMEOUT))
+            .map_err(|err| format!("failed to set camera write timeout: {}", err))?;
+
+        let connector = insecure_tls_connector()?;
+        let mut tls_stream = connector
+            .connect(&host, tcp)
+            .map_err(|err| format!("camera TLS handshake failed: {}", err))?;
+        tls_stream
+            .get_ref()
+            .set_read_timeout(Some(CAMERA_READ_TIMEOUT))
+            .map_err(|err| format!("failed to set TLS read timeout: {}", err))?;
+        tls_stream
+            .write_all(&build_camera_auth_packet(&username, &password))
+            .map_err(|err| format!("camera auth write failed: {}", err))?;
+
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            let mut header = [0u8; 16];
+            if !read_exact_interruptible(&mut tls_stream, &mut header, &stop)? {
+                return Ok(());
+            }
+
+            let payload_len =
+                u32::from_le_bytes(header[..4].try_into().unwrap_or_default()) as usize;
+            let mut payload = vec![0u8; payload_len];
+            if !read_exact_interruptible(&mut tls_stream, &mut payload, &stop)? {
+                return Ok(());
+            }
+
+            if header[4..] != CAMERA_PACKET_MAGIC {
+                continue;
+            }
+
+            if payload.len() < 4 || !payload.starts_with(&[0xFF, 0xD8]) || !payload.ends_with(&[0xFF, 0xD9]) {
+                continue;
+            }
+
+            match tx.try_send(payload) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => return Ok(()),
+            }
+        }
+    })();
+
+    match result {
+        Ok(()) => state.store(CAMERA_STREAM_ENDED, Ordering::Relaxed),
+        Err(err) => {
+            bambu_network_rs_log_debug(format!("bambu_network_rs_camera_stream: {}", err));
+            state.store(CAMERA_STREAM_ERROR, Ordering::Relaxed);
+        }
+    }
 }
 
 fn split_subfile_path(path: &str) -> (&str, Option<&str>) {
@@ -1047,6 +1209,83 @@ pub fn bambu_network_rs_tunnel_request(
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(request)),
         Err(_) => RUNTIME.block_on(request),
+    }
+}
+
+pub fn bambu_network_rs_start_camera_stream(
+    stream_id: u64,
+    tunnel_url: String,
+    device_id: String,
+) -> i32 {
+    bambu_network_rs_stop_camera_stream(stream_id);
+
+    let host = match printer_host_for_device(&device_id).or_else(|| tunnel_url_host(&tunnel_url)) {
+        Some(host) => host,
+        None => {
+            bambu_network_rs_log_debug(
+                "bambu_network_rs_camera_stream: missing host".to_string(),
+            );
+            return -1;
+        }
+    };
+
+    let username = tunnel_query_value(&tunnel_url, "user").unwrap_or_else(|| "bblp".to_string());
+    let password = match tunnel_query_value(&tunnel_url, "passwd") {
+        Some(password) => password,
+        None => {
+            bambu_network_rs_log_debug(
+                "bambu_network_rs_camera_stream: missing password".to_string(),
+            );
+            return -1;
+        }
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let state = Arc::new(AtomicI32::new(CAMERA_STREAM_ACTIVE));
+    let (tx, rx) = std_mpsc::sync_channel(CAMERA_QUEUE_DEPTH);
+
+    CAMERA_STREAMS.lock().unwrap().insert(
+        stream_id,
+        CameraStreamHandle {
+            receiver: rx,
+            stop: stop.clone(),
+            state: state.clone(),
+        },
+    );
+
+    bambu_network_rs_log_debug(format!(
+        "bambu_network_rs_camera_stream: start stream_id={} device={} host={}",
+        stream_id, device_id, host
+    ));
+
+    thread::spawn(move || camera_stream_worker(host, username, password, stop, state, tx));
+    0
+}
+
+pub fn bambu_network_rs_read_camera_frame(stream_id: u64) -> Vec<u8> {
+    let streams = CAMERA_STREAMS.lock().unwrap();
+    let Some(handle) = streams.get(&stream_id) else {
+        return Vec::new();
+    };
+
+    match handle.receiver.try_recv() {
+        Ok(frame) => frame,
+        Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => Vec::new(),
+    }
+}
+
+pub fn bambu_network_rs_camera_stream_state(stream_id: u64) -> i32 {
+    let streams = CAMERA_STREAMS.lock().unwrap();
+    let Some(handle) = streams.get(&stream_id) else {
+        return CAMERA_STREAM_ENDED;
+    };
+    handle.state.load(Ordering::Relaxed)
+}
+
+pub fn bambu_network_rs_stop_camera_stream(stream_id: u64) {
+    let handle = CAMERA_STREAMS.lock().unwrap().remove(&stream_id);
+    if let Some(handle) = handle {
+        handle.stop.store(true, Ordering::Relaxed);
     }
 }
 

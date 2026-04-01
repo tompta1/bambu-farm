@@ -60,6 +60,7 @@ static void persist_local_print_contexts();
 static std::string last_tunnel_error;
 static std::string preview_payload(const std::string &message, size_t limit = 1024);
 static constexpr size_t kTunnelDownloadChunkSize = 4 * 1024 * 1024;
+static std::atomic<std::uint64_t> next_video_stream_id{1};
 
 struct CompatTunnel
 {
@@ -69,9 +70,12 @@ struct CompatTunnel
     void *logger_context{nullptr};
     bool opened{false};
     bool control_stream_started{false};
+    bool video_stream_started{false};
     std::mutex mutex;
     std::deque<std::string> queued_responses;
     std::string active_response;
+    std::uint64_t video_stream_id{0};
+    unsigned long long active_decode_time{0};
 };
 
 struct LocalPrintContext
@@ -996,9 +1000,33 @@ int Bambu_StartStream(Bambu_Tunnel tunnel, bool video)
         return -1;
     }
     if (video) {
-        last_tunnel_error = "Bambu_StartStream: video stream unsupported";
-        return -1;
+        std::uint64_t stream_id = 0;
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            if (session->video_stream_started) {
+                return Bambu_success;
+            }
+            stream_id = next_video_stream_id.fetch_add(1);
+            session->video_stream_id = stream_id;
+            session->video_stream_started = true;
+            session->active_response.clear();
+            session->active_decode_time = 0;
+        }
+        const int result = bambu_network_rs_start_camera_stream(stream_id, session->url, session->device_id);
+        if (result != 0) {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            session->video_stream_started = false;
+            session->video_stream_id = 0;
+            last_tunnel_error = "Bambu_StartStream: failed to start camera stream";
+            return -1;
+        }
+        compat_tunnel_log(
+            session,
+            "Bambu_StartStream: started video stream stream_id=" + std::to_string(stream_id) +
+                " device=" + session->device_id);
+        return Bambu_success;
     }
+
     std::lock_guard<std::mutex> lock(session->mutex);
     session->control_stream_started = true;
     return Bambu_success;
@@ -1020,14 +1048,37 @@ int Bambu_StartStreamEx(Bambu_Tunnel tunnel, int type)
     return Bambu_success;
 }
 
-int Bambu_GetStreamCount(Bambu_Tunnel)
+int Bambu_GetStreamCount(Bambu_Tunnel tunnel)
 {
-    return 0;
+    auto *session = as_compat_tunnel(tunnel);
+    if (!session) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(session->mutex);
+    return session->video_stream_started ? 1 : 0;
 }
 
-int Bambu_GetStreamInfo(Bambu_Tunnel, int, Bambu_StreamInfo *)
+int Bambu_GetStreamInfo(Bambu_Tunnel tunnel, int index, Bambu_StreamInfo *info)
 {
-    return -1;
+    auto *session = as_compat_tunnel(tunnel);
+    if (!session || !info || index != 0) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (!session->video_stream_started) {
+        return -1;
+    }
+    std::memset(info, 0, sizeof(*info));
+    info->type = VIDE;
+    info->sub_type = MJPG;
+    info->format.video.width = 1920;
+    info->format.video.height = 1080;
+    info->format.video.frame_rate = 5;
+    info->format_type = video_jpeg;
+    info->format_size = 0;
+    info->max_frame_size = 512 * 1024;
+    info->format_buffer = nullptr;
+    return Bambu_success;
 }
 
 unsigned long Bambu_GetDuration(Bambu_Tunnel)
@@ -1094,7 +1145,40 @@ int Bambu_ReadSample(Bambu_Tunnel tunnel, Bambu_Sample *sample)
         return -1;
     }
 
+    std::uint64_t video_stream_id = 0;
     std::lock_guard<std::mutex> lock(session->mutex);
+    video_stream_id = session->video_stream_id;
+    if (session->video_stream_started && video_stream_id != 0) {
+        rust::Vec<std::uint8_t> frame = bambu_network_rs_read_camera_frame(video_stream_id);
+        if (!frame.empty()) {
+            session->active_response.clear();
+            session->active_response.reserve(frame.size());
+            for (std::uint8_t byte : frame) {
+                session->active_response.push_back(static_cast<char>(byte));
+            }
+            session->active_decode_time = 0;
+            compat_tunnel_log(
+                session,
+                "Bambu_ReadSample: video frame bytes=" + std::to_string(session->active_response.size()));
+            sample->itrack = 0;
+            sample->size = static_cast<int>(session->active_response.size());
+            sample->flags = 1;
+            sample->buffer = reinterpret_cast<unsigned char const *>(session->active_response.data());
+            sample->decode_time = session->active_decode_time;
+            return Bambu_success;
+        }
+
+        const int state = bambu_network_rs_camera_stream_state(video_stream_id);
+        if (state == 0) {
+            return Bambu_would_block;
+        }
+        if (state == 1) {
+            return Bambu_stream_end;
+        }
+        last_tunnel_error = "Bambu_ReadSample: camera stream failed";
+        return -1;
+    }
+
     if (session->queued_responses.empty()) {
         return Bambu_would_block;
     }
@@ -1141,16 +1225,25 @@ int Bambu_RecvMessage(Bambu_Tunnel tunnel, int *ctrl, char *data, int *len)
 void Bambu_Close(Bambu_Tunnel tunnel)
 {
     if (auto *session = as_compat_tunnel(tunnel)) {
+        std::uint64_t video_stream_id = 0;
         std::lock_guard<std::mutex> lock(session->mutex);
         session->opened = false;
         session->control_stream_started = false;
+        video_stream_id = session->video_stream_id;
+        session->video_stream_started = false;
+        session->video_stream_id = 0;
         session->queued_responses.clear();
         session->active_response.clear();
+        session->active_decode_time = 0;
+        if (video_stream_id != 0) {
+            bambu_network_rs_stop_camera_stream(video_stream_id);
+        }
     }
 }
 
 void Bambu_Destroy(Bambu_Tunnel tunnel)
 {
+    Bambu_Close(tunnel);
     delete as_compat_tunnel(tunnel);
 }
 

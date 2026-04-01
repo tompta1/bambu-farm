@@ -10,9 +10,43 @@ typedef char tchar;
 typedef void *Bambu_Tunnel;
 typedef void (*Logger)(void *context, int level, tchar const *msg);
 
+typedef enum Bambu_StreamType {
+    VIDE,
+    AUDI
+} Bambu_StreamType;
+
+typedef enum Bambu_VideoSubType {
+    AVC1,
+    MJPG
+} Bambu_VideoSubType;
+
+typedef enum Bambu_AudioSubType {
+    MP4A
+} Bambu_AudioSubType;
+
+typedef enum Bambu_FormatType {
+    video_avc_packet,
+    video_avc_byte_stream,
+    video_jpeg,
+    audio_raw,
+    audio_adts
+} Bambu_FormatType;
+
 typedef struct Bambu_StreamInfo {
     int type;
     int sub_type;
+    union {
+        struct {
+            int width;
+            int height;
+            int frame_rate;
+        } video;
+        struct {
+            int sample_rate;
+            int channel_count;
+            int sample_size;
+        } audio;
+    } format;
     int format_type;
     int format_size;
     int max_frame_size;
