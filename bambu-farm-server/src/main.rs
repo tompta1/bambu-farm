@@ -5,13 +5,13 @@ use bambu_farm::{
     UploadFileResponse,
 };
 use config::{Config, ConfigError, Value};
-use ftp::openssl::ssl::{SslContext, SslMethod, SslVerifyMode};
-use ftp::types::FileType;
-use ftp::FtpStream;
 use log::{error, info, warn};
 use paho_mqtt::{
     AsyncClient, ConnectOptionsBuilder, CreateOptionsBuilder, Message, SslOptionsBuilder,
 };
+use suppaftp::native_tls::TlsConnector;
+use suppaftp::types::FileType;
+use suppaftp::{NativeTlsConnector, NativeTlsFtpStream};
 use tempfile::NamedTempFile;
 use tokio::spawn;
 use tokio::task::spawn_blocking;
@@ -54,24 +54,63 @@ pub struct Farm {
     upload_handler: UploadHandler,
 }
 
-fn connect_rust_ftps(printer: &Printer) -> Result<FtpStream, String> {
-    let mut ssl_context = SslContext::builder(SslMethod::tls())
-        .map_err(|e| format!("failed to build TLS context: {}", e))?;
-    ssl_context.set_verify(SslVerifyMode::NONE);
+fn ftps_connector() -> Result<NativeTlsConnector, String> {
+    let mut builder = TlsConnector::builder();
+    builder.danger_accept_invalid_certs(true);
+    builder.danger_accept_invalid_hostnames(true);
+    let connector = builder
+        .build()
+        .map_err(|e| format!("failed to build TLS connector: {}", e))?;
+    Ok(NativeTlsConnector::from(connector))
+}
 
-    let mut ftp_stream = FtpStream::connect((printer.ip.as_str(), 21))
-        .map_err(|e| format!("failed to connect FTP control socket: {}", e))?;
-    ftp_stream = ftp_stream
-        .into_secure(ssl_context.build())
-        .map_err(|e| format!("failed to switch FTP session to TLS: {}", e))?;
+fn finalize_rust_ftps_login(
+    mut ftp_stream: NativeTlsFtpStream,
+    printer: &Printer,
+) -> Result<NativeTlsFtpStream, String> {
     ftp_stream
         .login("bblp", &printer.password)
         .map_err(|e| format!("failed to login to FTPS server: {}", e))?;
     ftp_stream
         .transfer_type(FileType::Binary)
         .map_err(|e| format!("failed to enable binary transfer mode: {}", e))?;
-
     Ok(ftp_stream)
+}
+
+fn connect_rust_ftps_implicit(printer: &Printer) -> Result<NativeTlsFtpStream, String> {
+    let connector = ftps_connector()?;
+    let ftp_stream =
+        NativeTlsFtpStream::connect_secure_implicit((printer.ip.as_str(), 990), connector, printer.ip.as_str())
+            .map_err(|e| format!("failed implicit FTPS connect on port 990: {}", e))?;
+    finalize_rust_ftps_login(ftp_stream, printer)
+}
+
+fn connect_rust_ftps_explicit(printer: &Printer) -> Result<NativeTlsFtpStream, String> {
+    let connector = ftps_connector()?;
+    let ftp_stream = NativeTlsFtpStream::connect((printer.ip.as_str(), 21))
+        .map_err(|e| format!("failed explicit FTP control connect on port 21: {}", e))?;
+    let ftp_stream = ftp_stream
+        .into_secure(connector, printer.ip.as_str())
+        .map_err(|e| format!("failed to switch explicit FTPS session to TLS: {}", e))?;
+    finalize_rust_ftps_login(ftp_stream, printer)
+}
+
+fn connect_rust_ftps(printer: &Printer) -> Result<NativeTlsFtpStream, String> {
+    match connect_rust_ftps_implicit(printer) {
+        Ok(ftp_stream) => Ok(ftp_stream),
+        Err(implicit_err) => {
+            info!(
+                "implicit FTPS connect failed for printer={} on port 990: {}; trying explicit FTPS on port 21",
+                printer.ip, implicit_err
+            );
+            connect_rust_ftps_explicit(printer).map_err(|explicit_err| {
+                format!(
+                    "implicit FTPS on port 990 failed: {}; explicit FTPS on port 21 failed: {}",
+                    implicit_err, explicit_err
+                )
+            })
+        }
+    }
 }
 
 fn upload_path_via_rust_ftps(printer: &Printer, remote_path: &str, local_path: &Path) -> Result<(), String> {
@@ -86,7 +125,7 @@ fn upload_path_via_rust_ftps(printer: &Printer, remote_path: &str, local_path: &
     let mut reader = std::fs::File::open(local_path)
         .map_err(|e| format!("failed to open local upload file: {}", e))?;
     ftp_stream
-        .put(remote_path, &mut reader)
+        .put_file(remote_path, &mut reader)
         .map_err(|e| format!("failed to upload via rust FTPS: {}", e))?;
     ftp_stream
         .quit()
