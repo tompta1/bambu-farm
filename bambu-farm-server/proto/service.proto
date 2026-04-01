@@ -38,6 +38,12 @@ message UploadFileRequest {
     string remote_path = 3;
 }
 
+message UploadFileChunk {
+    string dev_id = 1;
+    bytes blob = 2;
+    string remote_path = 3;
+}
+
 message UploadFileResponse {
     bool success = 1;
 }
@@ -47,4 +53,5 @@ service BambuFarm {
     rpc ConnectPrinter(ConnectRequest) returns (stream RecvMessage);
     rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
     rpc UploadFile(UploadFileRequest) returns (UploadFileResponse);
+    rpc UploadFileStream(stream UploadFileChunk) returns (UploadFileResponse);
 }

@@ -1,8 +1,18 @@
 #include "api.hpp"
+#include "print_job.hpp"
 #include "stdio.h"
 
+#include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
+#include <cstdlib>
+#include <execinfo.h>
+#include <mutex>
+#include <fstream>
+#include <filesystem>
 #include <thread>
+#include <unordered_map>
 
 #include "bambu-farm-client/src/api.rs.h"
 
@@ -19,46 +29,558 @@
 
 static OnMsgArrivedFn on_msg_arrived;
 static OnLocalConnectedFn on_local_connect;
+static OnMessageFn on_message;
 static OnMessageFn on_mqtt_message;
+static OnMessageFn on_user_message;
+static OnPrinterConnectedFn on_printer_connected;
+static OnServerConnectedFn on_server_connected;
+static OnServerErrFn on_server_error;
+static OnUserLoginFn on_user_login;
+static GetSubscribeFailureFn on_subscribe_failure;
 static std::string selected_device;
+static std::string config_dir_path;
 static std::string ca_path;
+static size_t user_login_log_counter = 0;
+static size_t build_login_cmd_log_counter = 0;
+static const char *kLanBackendUrl = "http://127.0.0.1:47403";
+static std::atomic<bool> lan_user_logged_in{true};
+static std::atomic<bool> auto_connect_pending{false};
+static std::atomic<bool> printer_connected{false};
+static std::atomic<bool> connect_in_progress{false};
+static std::mutex printer_name_overrides_mutex;
+static std::unordered_map<std::string, std::string> printer_name_overrides;
+static std::unordered_map<std::string, std::string> last_printer_json_by_id;
+
+static void write_diag(const std::string &message);
+
+static std::string selected_device_state_path()
+{
+    if (!config_dir_path.empty()) {
+        return config_dir_path + "/oss-last-device.txt";
+    }
+
+    const char *xdg = std::getenv("XDG_CONFIG_HOME");
+    const char *home = std::getenv("HOME");
+    if (xdg && *xdg) {
+        return std::string(xdg) + "/BambuStudio/oss-last-device.txt";
+    }
+    if (home && *home) {
+        return std::string(home) + "/.config/BambuStudio/oss-last-device.txt";
+    }
+    return "/tmp/bambu-oss-last-device.txt";
+}
+
+static std::string printer_names_state_path()
+{
+    if (!config_dir_path.empty()) {
+        return config_dir_path + "/oss-printer-names.tsv";
+    }
+
+    const char *xdg = std::getenv("XDG_CONFIG_HOME");
+    const char *home = std::getenv("HOME");
+    if (xdg && *xdg) {
+        return std::string(xdg) + "/BambuStudio/oss-printer-names.tsv";
+    }
+    if (home && *home) {
+        return std::string(home) + "/.config/BambuStudio/oss-printer-names.tsv";
+    }
+    return "/tmp/bambu-oss-printer-names.tsv";
+}
+
+static bool find_json_string_value_range(const std::string &json, const std::string &key, size_t &value_start, size_t &value_end)
+{
+    const std::string needle = "\"" + key + "\": \"";
+    const size_t key_pos = json.find(needle);
+    if (key_pos == std::string::npos) {
+        return false;
+    }
+
+    value_start = key_pos + needle.size();
+    value_end = value_start;
+    bool escaped = false;
+    while (value_end < json.size()) {
+        const char c = json[value_end];
+        if (!escaped && c == '"') {
+            return true;
+        }
+        if (!escaped && c == '\\') {
+            escaped = true;
+        } else {
+            escaped = false;
+        }
+        value_end++;
+    }
+    return false;
+}
+
+static std::string json_string_field(const std::string &json, const std::string &key)
+{
+    size_t value_start = 0;
+    size_t value_end = 0;
+    if (!find_json_string_value_range(json, key, value_start, value_end)) {
+        return "";
+    }
+    return json.substr(value_start, value_end - value_start);
+}
+
+static std::string apply_printer_name_override(const std::string &json)
+{
+    const std::string dev_id = json_string_field(json, "dev_id");
+    if (dev_id.empty()) {
+        return json;
+    }
+
+    std::string override_name;
+    {
+        std::lock_guard<std::mutex> lock(printer_name_overrides_mutex);
+        const auto it = printer_name_overrides.find(dev_id);
+        if (it == printer_name_overrides.end() || it->second.empty()) {
+            return json;
+        }
+        override_name = it->second;
+    }
+
+    size_t value_start = 0;
+    size_t value_end = 0;
+    if (!find_json_string_value_range(json, "dev_name", value_start, value_end)) {
+        return json;
+    }
+
+    std::string rewritten = json;
+    rewritten.replace(value_start, value_end - value_start, BambuPlugin::json_escape(override_name));
+    return rewritten;
+}
+
+static void persist_printer_name_overrides()
+{
+    const std::string path = printer_names_state_path();
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out.is_open()) {
+        write_diag("persist_printer_name_overrides: failed path=" + path);
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(printer_name_overrides_mutex);
+    for (const auto &[dev_id, name] : printer_name_overrides) {
+        if (!dev_id.empty() && !name.empty()) {
+            out << dev_id << '\t' << name << '\n';
+        }
+    }
+    write_diag("persist_printer_name_overrides: wrote path=" + path);
+}
+
+static void load_printer_name_overrides()
+{
+    const std::string path = printer_names_state_path();
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        write_diag("load_printer_name_overrides: no state path=" + path);
+        return;
+    }
+
+    std::unordered_map<std::string, std::string> loaded;
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t tab_pos = line.find('\t');
+        if (tab_pos == std::string::npos) {
+            continue;
+        }
+        const std::string dev_id = line.substr(0, tab_pos);
+        const std::string name = line.substr(tab_pos + 1);
+        if (!dev_id.empty() && !name.empty()) {
+            loaded[dev_id] = name;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(printer_name_overrides_mutex);
+        printer_name_overrides = std::move(loaded);
+    }
+    write_diag("load_printer_name_overrides: loaded path=" + path);
+}
+
+static void persist_selected_device()
+{
+    const std::string path = selected_device_state_path();
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+
+    if (selected_device.empty()) {
+        std::filesystem::remove(path, ec);
+        write_diag("persist_selected_device: cleared path=" + path);
+        return;
+    }
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out.is_open()) {
+        write_diag("persist_selected_device: failed path=" + path);
+        return;
+    }
+    out << selected_device;
+    write_diag("persist_selected_device: wrote dev_id=" + selected_device + " path=" + path);
+}
+
+static void load_selected_device()
+{
+    const std::string path = selected_device_state_path();
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        write_diag("load_selected_device: no state path=" + path);
+        return;
+    }
+
+    std::string loaded;
+    std::getline(in, loaded);
+    if (loaded.empty()) {
+        write_diag("load_selected_device: empty state path=" + path);
+        return;
+    }
+
+    selected_device = loaded;
+    auto_connect_pending.store(true);
+    write_diag("load_selected_device: dev_id=" + selected_device + " path=" + path);
+}
+
+static bool printer_json_matches_selected_device(const std::string &json)
+{
+    if (selected_device.empty()) {
+        return false;
+    }
+    const std::string needle = "\"dev_id\": \"" + selected_device + "\"";
+    return json.find(needle) != std::string::npos;
+}
+
+static void connect_selected_device_if_pending(const std::string &json)
+{
+    if (!auto_connect_pending.load() || !lan_user_logged_in.load()) {
+        return;
+    }
+    if (!printer_json_matches_selected_device(json)) {
+        return;
+    }
+
+    auto_connect_pending.store(false);
+    write_diag("connect_selected_device_if_pending: autoconnect dev_id=" + selected_device);
+    if (on_printer_connected) {
+        on_printer_connected(selected_device);
+    }
+    bambu_network_rs_connect(selected_device);
+}
+
+static BambuPlugin::LoginState lan_login_state()
+{
+    BambuPlugin::LoginState state;
+    state.logged_in = lan_user_logged_in.load();
+    if (state.logged_in) {
+        state.user_id = "00000000000000001";
+        state.user_name = "LAN User";
+        state.nickname = "LAN User";
+        state.avatar = "";
+    }
+    return state;
+}
+
+static void set_lan_login_state(bool logged_in, bool notify)
+{
+    lan_user_logged_in.store(logged_in);
+    write_diag(std::string("set_lan_login_state: logged_in=") + (logged_in ? "true" : "false"));
+    if (notify && on_user_login) {
+        on_user_login(0, logged_in);
+    }
+}
+
+static void write_diag(const std::string &message) {
+    const char *xdg = std::getenv("XDG_CONFIG_HOME");
+    const char *home = std::getenv("HOME");
+    std::string log_path;
+
+    if (xdg && *xdg) {
+        log_path = std::string(xdg) + "/BambuStudio/oss-plugin-debug.log";
+    } else if (home && *home) {
+        log_path = std::string(home) + "/.config/BambuStudio/oss-plugin-debug.log";
+    } else {
+        log_path = "/tmp/bambu-oss-plugin-debug.log";
+    }
+
+    std::ofstream log(log_path, std::ios::app);
+    if (log.is_open()) {
+        log << message << "\n";
+    }
+}
+
+static void write_periodic_diag(const char *label, size_t &counter, size_t period, const std::string &message)
+{
+    counter++;
+    if (counter <= 5 || (period > 0 && (counter % period) == 0)) {
+        write_diag(message + " count=" + std::to_string(counter));
+    }
+}
+
+static void write_backtrace_once(const char *label)
+{
+    static bool wrote_check_debug = false;
+    static bool wrote_get_version = false;
+
+    bool *slot = nullptr;
+    if (std::string(label) == "check_debug_consistent") {
+        slot = &wrote_check_debug;
+    } else if (std::string(label) == "get_version") {
+        slot = &wrote_get_version;
+    }
+
+    if (slot && *slot) {
+        return;
+    }
+    if (slot) {
+        *slot = true;
+    }
+
+    void *frames[16];
+    int count = backtrace(frames, 16);
+    char **symbols = backtrace_symbols(frames, count);
+    if (!symbols) {
+        write_diag(std::string("backtrace unavailable for ") + label);
+        return;
+    }
+
+    write_diag(std::string("backtrace begin: ") + label);
+    for (int i = 0; i < count; ++i) {
+        write_diag(std::string("  ") + symbols[i]);
+    }
+    write_diag(std::string("backtrace end: ") + label);
+    free(symbols);
+}
+
+static std::string preview_payload(const std::string &message, size_t limit = 1024)
+{
+    const size_t preview_len = std::min(message.size(), limit);
+    std::string preview = BambuPlugin::json_escape(message.substr(0, preview_len));
+    if (preview_len < message.size()) {
+        preview += "...";
+    }
+    return preview;
+}
+
+static void log_print_params(const char *fn, const PrintParams &params)
+{
+    write_diag(
+        std::string(fn) +
+        ": dev_id=" + params.dev_id +
+        " task_name=" + params.task_name +
+        " project_name=" + params.project_name +
+        " filename=" + params.filename +
+        " ftp_file=" + params.ftp_file +
+        " dst_file=" + params.dst_file +
+        " plate_index=" + std::to_string(params.plate_index) +
+        " ams_mapping=" + params.ams_mapping +
+        " ams_mapping2=" + params.ams_mapping2 +
+        " ams_mapping_info=" + params.ams_mapping_info +
+        " use_ams=" + (params.task_use_ams ? "true" : "false") +
+        " bed_leveling=" + (params.task_bed_leveling ? "true" : "false") +
+        " flow_cali=" + (params.task_flow_cali ? "true" : "false") +
+        " vibration_cali=" + (params.task_vibration_cali ? "true" : "false") +
+        " layer_inspect=" + (params.task_layer_inspect ? "true" : "false") +
+        " timelapse=" + (params.task_record_timelapse ? "true" : "false")
+    );
+}
+
+static void report_update_status(OnUpdateStatusFn update_fn, int status, int code, const std::string &message)
+{
+    write_diag(
+        "report_update_status: status=" + std::to_string(status) +
+        " code=" + std::to_string(code) +
+        " message=" + message +
+        " callback=" + (update_fn ? "set" : "null")
+    );
+    if (!update_fn) {
+        return;
+    }
+    update_fn(status, code, message);
+}
+
+static void log_local_file_probe(const char *context, const std::string &path)
+{
+    errno = 0;
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        const int open_errno = errno;
+        write_diag(
+            std::string(context) +
+            " local_file_probe=open_failed path=" + path +
+            " errno=" + std::to_string(open_errno) +
+            " error=" + std::strerror(open_errno)
+        );
+        return;
+    }
+
+    const std::streamoff end_pos = file.tellg();
+    write_diag(
+        std::string(context) +
+        " local_file_probe=open_ok path=" + path +
+        " size=" + std::to_string(static_cast<long long>(end_pos))
+    );
+}
+
+static int start_local_print_impl(const PrintParams &params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
+{
+    log_print_params("bambu_network_start_local_print", params);
+    report_update_status(update_fn, PrintingStageCreate, BAMBU_NETWORK_SUCCESS, "Preparing print");
+
+    if (cancel_fn && cancel_fn()) {
+        report_update_status(update_fn, PrintingStageERROR, BAMBU_NETWORK_ERR_CANCELED, "Canceled");
+        return BAMBU_NETWORK_ERR_CANCELED;
+    }
+
+    const std::string remote_filename = BambuPlugin::resolve_remote_filename(params);
+    const std::string plate_path = BambuPlugin::resolve_plate_metadata_path(params);
+
+    report_update_status(update_fn, PrintingStageUpload, BAMBU_NETWORK_SUCCESS, "Uploading to printer");
+    log_local_file_probe("bambu_network_start_local_print", params.filename);
+    const int upload_result = bambu_network_rs_upload_file(params.dev_id, params.filename, remote_filename);
+    write_diag(
+        "bambu_network_start_local_print upload_result=" +
+        std::to_string(upload_result) +
+        " remote_filename=" + remote_filename +
+        " plate_path=" + plate_path
+    );
+    if (upload_result != BAMBU_NETWORK_SUCCESS) {
+        report_update_status(update_fn, PrintingStageERROR, upload_result, "Upload failed");
+        return BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED;
+    }
+
+    if (cancel_fn && cancel_fn()) {
+        report_update_status(update_fn, PrintingStageERROR, BAMBU_NETWORK_ERR_CANCELED, "Canceled");
+        return BAMBU_NETWORK_ERR_CANCELED;
+    }
+
+    report_update_status(update_fn, PrintingStageSending, BAMBU_NETWORK_SUCCESS, "Sending print command");
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    std::string json = BambuPlugin::build_project_file_command(params, remote_filename, plate_path);
+    write_diag("bambu_network_start_local_print command=" + json);
+
+    const int send_result = bambu_network_rs_send(params.dev_id, json);
+    write_diag("bambu_network_start_local_print send_result=" + std::to_string(send_result));
+    if (send_result != BAMBU_NETWORK_SUCCESS) {
+        report_update_status(update_fn, PrintingStageERROR, send_result, "Send failed");
+        return BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
+    }
+
+    if (wait_fn) {
+        report_update_status(update_fn, PrintingStageWaitPrinter, BAMBU_NETWORK_SUCCESS, "Waiting for printer");
+        const bool wait_ok = wait_fn(PrintingStageWaitPrinter, "{}");
+        write_diag(std::string("bambu_network_start_local_print wait_result=") + (wait_ok ? "true" : "false"));
+        if (!wait_ok) {
+            report_update_status(update_fn, PrintingStageERROR, BAMBU_NETWORK_ERR_TIMEOUT, "Wait failed");
+            return BAMBU_NETWORK_ERR_TIMEOUT;
+        }
+    }
+
+    report_update_status(update_fn, PrintingStageFinished, BAMBU_NETWORK_SUCCESS, "Print submitted");
+    return BAMBU_NETWORK_SUCCESS;
+}
 
 void bambu_init() {
     LOG_CALL();
+    write_diag("bambu_init");
 }
 
 void bambu_network_cb_printer_available(const std::string &json) {
-    if (on_msg_arrived) {
-        on_msg_arrived(json);
+    const std::string effective_json = apply_printer_name_override(json);
+    const std::string dev_id = json_string_field(effective_json, "dev_id");
+    if (!dev_id.empty()) {
+        std::lock_guard<std::mutex> lock(printer_name_overrides_mutex);
+        last_printer_json_by_id[dev_id] = effective_json;
     }
+    if (on_msg_arrived) {
+        on_msg_arrived(effective_json);
+    }
+    connect_selected_device_if_pending(effective_json);
 }
 void bambu_network_cb_message_recv(const std::string &device_id, const std::string &message) {
+    if (on_message || on_mqtt_message) {
+        write_diag(
+            "bambu_network_cb_message_recv: dev_id=" + device_id +
+            " msg_len=" + std::to_string(message.size()) +
+            " preview=\"" + preview_payload(message) + "\""
+        );
+    }
+
     if (on_mqtt_message) {
-        LOG_CALL_ARGS("Calling MQTT callback with:\n%s", message.c_str());
+        write_diag("bambu_network_cb_message_recv: entering local callback");
         on_mqtt_message(device_id, message);
+        write_diag("bambu_network_cb_message_recv: local callback returned");
+    }
+
+    if (on_message) {
+        write_diag("bambu_network_cb_message_recv: entering message callback");
+        on_message(device_id, message);
+        write_diag("bambu_network_cb_message_recv: message callback returned");
     }
 }
 void bambu_network_cb_connected(const std::string &device_id) {
-    LOG_CALL();
+    write_diag("bambu_network_cb_connected: " + device_id);
+    connect_in_progress.store(false);
+    printer_connected.store(true);
+    if (on_printer_connected) {
+        write_diag("bambu_network_cb_connected: signaling printer connected " + device_id);
+        on_printer_connected(device_id);
+    }
     if (on_local_connect) {
-        LOG_CALL_ARGS("Calling connected callback for device %s", device_id.c_str());
+        write_diag("bambu_network_cb_connected: calling on_local_connect");
         on_local_connect(0, device_id, "Connected");
+        write_diag("bambu_network_cb_connected: on_local_connect returned");
+    }
+}
+
+void bambu_network_cb_disconnected(const std::string &device_id, int status, const std::string &message) {
+    write_diag(
+        "bambu_network_cb_disconnected: dev_id=" + device_id +
+        " status=" + std::to_string(status) +
+        " message=" + message
+    );
+    connect_in_progress.store(false);
+    const bool was_connected = printer_connected.exchange(false);
+    if (on_local_connect && (was_connected || status == ConnectStatusFailed)) {
+        write_diag("bambu_network_cb_disconnected: calling on_local_connect");
+        on_local_connect(status, device_id, message);
+        write_diag("bambu_network_cb_disconnected: on_local_connect returned");
     }
 }
 
 bool bambu_network_check_debug_consistent(bool is_debug)
 {
     LOG_CALL();
-    return true;
+    write_backtrace_once("check_debug_consistent");
+    const char *override = std::getenv("BAMBU_NETWORK_DEBUG_CONSISTENT_OVERRIDE");
+    bool result = true;
+    if (override && *override) {
+        result = std::string(override) == "1" || std::string(override) == "true" || std::string(override) == "TRUE";
+    }
+    write_diag(
+        std::string("bambu_network_check_debug_consistent: input=") +
+        (is_debug ? "true" : "false") +
+        " result=" +
+        (result ? "true" : "false")
+    );
+    return result;
 }
 std::string bambu_network_get_version(void)
 {
     LOG_CALL();
-    return BAMBU_NETWORK_AGENT_VERSION;
+    write_backtrace_once("get_version");
+    const char *override = std::getenv("BAMBU_NETWORK_AGENT_VERSION_OVERRIDE");
+    const std::string version = (override && *override) ? override : BAMBU_NETWORK_AGENT_VERSION;
+    write_diag(std::string("bambu_network_get_version: ") + version);
+    return version;
 }
-void *bambu_network_create_agent(void)
+void *bambu_network_create_agent(std::string log_dir)
 {
     LOG_CALL();
+    write_diag("bambu_network_create_agent: log_dir=" + log_dir);
     bambu_network_rs_init();
     return (void*)0x10000000;
 }
@@ -75,6 +597,10 @@ int bambu_network_init_log(void *agent_ptr)
 int bambu_network_set_config_dir(void *agent_ptr, std::string config_dir)
 {
     LOG_CALL_ARGS("%s", config_dir.c_str());
+    write_diag("bambu_network_set_config_dir: " + config_dir);
+    config_dir_path = config_dir;
+    load_selected_device();
+    load_printer_name_overrides();
     return 0;
 }
 int bambu_network_set_cert_file(void *agent_ptr, std::string folder, std::string filename)
@@ -103,16 +629,31 @@ int bambu_network_set_on_ssdp_msg_fn(void *agent_ptr, OnMsgArrivedFn fn)
 int bambu_network_set_on_user_login_fn(void *agent_ptr, OnUserLoginFn fn)
 {
     LOG_CALL();
+    on_user_login = fn;
+    if (on_user_login) {
+        write_diag("bambu_network_set_on_user_login_fn: signaling current LAN login state");
+        on_user_login(0, lan_user_logged_in.load());
+    }
     return 0;
 }
 int bambu_network_set_on_printer_connected_fn(void *agent_ptr, OnPrinterConnectedFn fn)
 {
     LOG_CALL();
+    on_printer_connected = fn;
+    if (on_printer_connected && !selected_device.empty() && printer_connected.load()) {
+        write_diag("bambu_network_set_on_printer_connected_fn: signaling existing printer " + selected_device);
+        on_printer_connected(selected_device);
+    }
     return 0;
 }
 int bambu_network_set_on_server_connected_fn(void *agent_ptr, OnServerConnectedFn fn)
 {
     LOG_CALL();
+    on_server_connected = fn;
+    if (on_server_connected) {
+        write_diag("bambu_network_set_on_server_connected_fn: signaling LAN server connected");
+        on_server_connected(ConnectStatusOk, 0);
+    }
     return 0;
 }
 int bambu_network_set_on_http_error_fn(void *agent_ptr, OnHttpErrorFn fn)
@@ -129,7 +670,8 @@ int bambu_network_set_get_country_code_fn(void *agent_ptr, GetCountryCodeFn fn)
 int bambu_network_set_on_message_fn(void *agent_ptr, OnMessageFn fn)
 {
     LOG_CALL();
-    // TBD but it seems like this only applies to server connections.
+    write_diag("bambu_network_set_on_message_fn");
+    on_message = fn;
     return 0;
 }
 int bambu_network_set_on_local_connect_fn(void *agent_ptr, OnLocalConnectedFn fn)
@@ -141,6 +683,7 @@ int bambu_network_set_on_local_connect_fn(void *agent_ptr, OnLocalConnectedFn fn
 int bambu_network_set_on_local_message_fn(void *agent_ptr, OnMessageFn fn)
 {
     LOG_CALL();
+    write_diag("bambu_network_set_on_local_message_fn");
     on_mqtt_message = fn;
     return 0;
 }
@@ -157,8 +700,8 @@ int bambu_network_connect_server(void *agent_ptr)
 }
 bool bambu_network_is_server_connected(void *agent_ptr)
 {
-    LOG_CALL();
-    return false;
+    write_diag("bambu_network_is_server_connected: returning true (LAN mode)");
+    return true;
 }
 int bambu_network_refresh_connection(void *agent_ptr)
 {
@@ -175,7 +718,7 @@ int bambu_network_stop_subscribe(void *agent_ptr, std::string module)
     LOG_CALL();
     return 0;
 }
-int bambu_network_send_message(void *agent_ptr, std::string dev_id, std::string json_str, int qos)
+int bambu_network_send_message(void *agent_ptr, std::string dev_id, std::string json_str, int qos, int flag)
 {
     LOG_CALL();
     // TODO: Maybe send message here, but this seems cloud-only.
@@ -184,18 +727,41 @@ int bambu_network_send_message(void *agent_ptr, std::string dev_id, std::string 
 int bambu_network_connect_printer(void *agent_ptr, std::string dev_id, std::string dev_ip, std::string username, std::string password, bool use_ssl)
 {
     LOG_CALL_ARGS("%s %s %s %s", dev_id.c_str(), dev_ip.c_str(), username.c_str(), password.c_str());
+    if (selected_device == dev_id && printer_connected.load()) {
+        write_diag("bambu_network_connect_printer: already connected " + dev_id);
+        return 0;
+    }
+    if (selected_device == dev_id && connect_in_progress.load()) {
+        write_diag("bambu_network_connect_printer: connect already in progress " + dev_id);
+        return 0;
+    }
+    write_diag("bambu_network_connect_printer: " + dev_id + "@" + dev_ip);
+    selected_device = dev_id;
+    auto_connect_pending.store(false);
+    connect_in_progress.store(true);
+    printer_connected.store(false);
+    persist_selected_device();
     bambu_network_rs_connect(dev_id);
     return 0;
 }
 int bambu_network_disconnect_printer(void *agent_ptr)
 {
     LOG_CALL();
+    if (connect_in_progress.load() && !printer_connected.load()) {
+        write_diag("bambu_network_disconnect_printer: ignoring disconnect during in-flight connect");
+        return 0;
+    }
+    if (!selected_device.empty()) {
+        write_diag("bambu_network_disconnect_printer: dev_id=" + selected_device);
+        bambu_network_rs_disconnect(selected_device);
+    }
     return 0;
 }
-int bambu_network_send_message_to_printer(void *agent_ptr, std::string dev_id, std::string json_str, int qos)
+int bambu_network_send_message_to_printer(void *agent_ptr, std::string dev_id, std::string json_str, int qos, int flag)
 {
-    LOG_CALL_ARGS("%s %s", dev_id.c_str(), json_str.c_str());
+    write_diag("bambu_network_send_message_to_printer: dev_id=" + dev_id);
     bambu_network_rs_send(dev_id, json_str);
+    write_diag("bambu_network_send_message_to_printer: returned");
     return 0;
 }
 bool bambu_network_start_discovery(void *agent_ptr, bool start, bool sending)
@@ -205,43 +771,76 @@ bool bambu_network_start_discovery(void *agent_ptr, bool start, bool sending)
 }
 int bambu_network_change_user(void *agent_ptr, std::string user_info)
 {
-    return BAMBU_NETWORK_ERR_CONNECT_FAILED;
+    write_diag("bambu_network_change_user: user_info_len=" + std::to_string(user_info.size()));
+    set_lan_login_state(true, true);
+    return BAMBU_NETWORK_SUCCESS;
 }
 bool bambu_network_is_user_login(void *agent_ptr)
 {
-    return false;
+    write_periodic_diag(
+        "bambu_network_is_user_login",
+        user_login_log_counter,
+        50,
+        std::string("bambu_network_is_user_login: returning ") +
+        (lan_user_logged_in.load() ? "true" : "false") +
+        " (LAN mode)"
+    );
+    return lan_user_logged_in.load();
 }
-int bambu_network_user_logout(void *agent_ptr)
+int bambu_network_user_logout(void *agent_ptr, bool request)
 {
+    write_diag(std::string("bambu_network_user_logout request=") + (request ? "true" : "false"));
+    if (!selected_device.empty()) {
+        bambu_network_rs_disconnect(selected_device);
+    }
+    printer_connected.store(false);
+    selected_device.clear();
+    auto_connect_pending.store(false);
+    persist_selected_device();
+    set_lan_login_state(false, true);
     return 0;
 }
 std::string bambu_network_get_user_id(void *agent_ptr)
 {
-    return "";
+    write_diag("bambu_network_get_user_id");
+    return lan_login_state().user_id;
 }
 std::string bambu_network_get_user_name(void *agent_ptr)
 {
-    return "";
+    write_diag("bambu_network_get_user_name");
+    return lan_login_state().user_name;
 }
 std::string bambu_network_get_user_avatar(void *agent_ptr)
 {
-    return "";
+    write_diag("bambu_network_get_user_avatar");
+    return lan_login_state().avatar;
 }
 std::string bambu_network_get_user_nickanme(void *agent_ptr)
 {
-    return "";
+    write_diag("bambu_network_get_user_nickanme");
+    return lan_login_state().nickname;
 }
 std::string bambu_network_build_login_cmd(void *agent_ptr)
 {
-    return "";
+    LOG_CALL();
+    const std::string json = BambuPlugin::build_logged_in_login_cmd(lan_login_state());
+    write_periodic_diag(
+        "bambu_network_build_login_cmd",
+        build_login_cmd_log_counter,
+        20,
+        "bambu_network_build_login_cmd: returning " + json
+    );
+    return json;
 }
 std::string bambu_network_build_logout_cmd(void *agent_ptr)
 {
-    return "";
+    LOG_CALL();
+    return BambuPlugin::build_logout_cmd("lan");
 }
 std::string bambu_network_build_login_info(void *agent_ptr)
 {
-    return "";
+    LOG_CALL();
+    return BambuPlugin::build_login_info(lan_login_state(), kLanBackendUrl, kLanBackendUrl);
 }
 int bambu_network_bind(void *agent_ptr, std::string dev_ip, std::string dev_id, std::string sec_link, std::string timezone, bool improved, OnUpdateStatusFn update_fn)
 {
@@ -256,52 +855,72 @@ int bambu_network_unbind(void *agent_ptr, std::string dev_id)
 std::string bambu_network_get_bambulab_host(void *agent_ptr)
 {
     LOG_CALL();
-    return "localhost";
+    return "bambulab.com";
 }
 std::string bambu_network_get_user_selected_machine(void *agent_ptr)
 {
-    LOG_CALL();
+    write_diag("bambu_network_get_user_selected_machine: " + selected_device);
     return selected_device;
 }
 int bambu_network_set_user_selected_machine(void *agent_ptr, std::string dev_id)
 {
-    LOG_CALL_ARGS("%s", dev_id.c_str());
+    write_diag("bambu_network_set_user_selected_machine: " + dev_id);
     selected_device = dev_id;
+    auto_connect_pending.store(!dev_id.empty());
+    persist_selected_device();
     return 0;
 }
-int bambu_network_start_print(void *agent_ptr, PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn)
+int bambu_network_start_print(void *agent_ptr, PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
+{
+    write_diag("bambu_network_start_print");
+    return start_local_print_impl(params, update_fn, cancel_fn, wait_fn);
+}
+int bambu_network_start_local_print_with_record(void *agent_ptr, PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
     LOG_CALL();
-    return bambu_network_start_local_print(agent_ptr, params, update_fn, cancel_fn);
+    return start_local_print_impl(params, update_fn, cancel_fn, wait_fn);
 }
-int bambu_network_start_local_print_with_record(void *agent_ptr, PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn)
-{
-    LOG_CALL();
-    return bambu_network_start_local_print(agent_ptr, params, update_fn, cancel_fn);
-}
-int bambu_network_start_send_gcode_to_sdcard(void *agent_ptr, PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn)
+int bambu_network_start_send_gcode_to_sdcard(void *agent_ptr, PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
     LOG_CALL_ARGS("%s %s %s %s", params.project_name.c_str(), params.filename.c_str(), params.ftp_file.c_str(), params.dst_file.c_str());
-    return 0;
+    log_print_params("bambu_network_start_send_gcode_to_sdcard", params);
+    report_update_status(update_fn, PrintingStageCreate, BAMBU_NETWORK_SUCCESS, "Preparing upload");
+
+    const std::string remote_filename = BambuPlugin::resolve_remote_filename(params);
+    report_update_status(update_fn, PrintingStageUpload, BAMBU_NETWORK_SUCCESS, "Uploading to printer");
+    log_local_file_probe("bambu_network_start_send_gcode_to_sdcard", params.filename);
+    const int upload_result = bambu_network_rs_upload_file(params.dev_id, params.filename, remote_filename);
+    write_diag(
+        "bambu_network_start_send_gcode_to_sdcard upload_result=" +
+        std::to_string(upload_result) +
+        " remote_filename=" + remote_filename
+    );
+
+    if (upload_result != BAMBU_NETWORK_SUCCESS) {
+        report_update_status(update_fn, PrintingStageERROR, upload_result, "Upload failed");
+        return BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED;
+    }
+
+    report_update_status(update_fn, PrintingStageFinished, BAMBU_NETWORK_SUCCESS, "Upload finished");
+    return BAMBU_NETWORK_SUCCESS;
 }
 int bambu_network_start_local_print(void *agent_ptr, PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn)
 {
     LOG_CALL_ARGS("%s %s %s", params.project_name.c_str(), params.filename.c_str(), params.ams_mapping.c_str());
-    bambu_network_rs_upload_file(params.dev_id, params.filename, "print.gcode.3mf");
-    std::this_thread::sleep_for (std::chrono::seconds(1));
-    std::string json = "{\"print\":{\"sequence_id\":0,\"command\":\"project_file\",\"param\":\"Metadata/plate_1.gcode\",\"subtask_name\":\"print.gcode.3mf\",\"url\":\"ftp://print.gcode.3mf\",\"timelapse\":false,\"bed_leveling\":true,\"flow_cali\":false,\"vibration_cali\":false,\"layer_inspect\":true,\"use_ams\":true}}";
-    bambu_network_rs_send(params.dev_id, json);
-    return 0;
+    return start_local_print_impl(params, update_fn, cancel_fn, nullptr);
 }
 int bambu_network_get_user_presets(void *agent_ptr, std::map<std::string, std::map<std::string, std::string>> *user_presets)
 {
-    LOG_CALL();
+    write_diag("bambu_network_get_user_presets");
     return 0;
 }
 std::string bambu_network_request_setting_id(void *agent_ptr, std::string name, std::map<std::string, std::string> *values_map, unsigned int *http_code)
 {
-    LOG_CALL();
-    return 0;
+    write_diag("bambu_network_request_setting_id: " + name);
+    if (http_code) {
+        *http_code = 200;
+    }
+    return "";
 }
 int bambu_network_put_setting(void *agent_ptr, std::string setting_id, std::string name, std::map<std::string, std::string> *values_map, unsigned int *http_code)
 {
@@ -310,7 +929,7 @@ int bambu_network_put_setting(void *agent_ptr, std::string setting_id, std::stri
 }
 int bambu_network_get_setting_list(void *agent_ptr, std::string bundle_version, ProgressFn pro_fn, WasCancelledFn cancel_fn)
 {
-    LOG_CALL();
+    write_diag("bambu_network_get_setting_list: bundle_version=" + bundle_version);
     return 0;
 }
 int bambu_network_delete_setting(void *agent_ptr, std::string setting_id)
@@ -321,7 +940,7 @@ int bambu_network_delete_setting(void *agent_ptr, std::string setting_id)
 std::string bambu_network_get_studio_info_url(void *agent_ptr)
 {
     LOG_CALL();
-    return "";
+    return "https://studio.bambulab.com";
 }
 int bambu_network_set_extra_http_header(void *agent_ptr, std::map<std::string, std::string> extra_headers)
 {
@@ -378,7 +997,37 @@ int bambu_network_query_bind_status(void *agent_ptr, std::vector<std::string> qu
 }
 int bambu_network_modify_printer_name(void *agent_ptr, std::string dev_id, std::string dev_name)
 {
-    LOG_CALL();
+    write_diag(
+        "bambu_network_modify_printer_name: dev_id=" + dev_id +
+        " dev_name=" + dev_name
+    );
+    {
+        std::lock_guard<std::mutex> lock(printer_name_overrides_mutex);
+        if (dev_name.empty()) {
+            printer_name_overrides.erase(dev_id);
+        } else {
+            printer_name_overrides[dev_id] = dev_name;
+        }
+    }
+    persist_printer_name_overrides();
+
+    std::string last_json;
+    std::string updated_json;
+    {
+        std::lock_guard<std::mutex> lock(printer_name_overrides_mutex);
+        const auto it = last_printer_json_by_id.find(dev_id);
+        if (it != last_printer_json_by_id.end()) {
+            last_json = it->second;
+        }
+    }
+    if (!last_json.empty()) {
+        updated_json = apply_printer_name_override(last_json);
+        std::lock_guard<std::mutex> lock(printer_name_overrides_mutex);
+        last_printer_json_by_id[dev_id] = updated_json;
+    }
+    if (!updated_json.empty() && on_msg_arrived) {
+        on_msg_arrived(updated_json);
+    }
     return 0;
 }
 int bambu_network_get_camera_url(void *agent_ptr, std::string dev_id, std::function<void(std::string)> callback)
@@ -404,21 +1053,27 @@ int bambu_network_get_profile_3mf(void *agent_ptr, BBLProfile *profile)
 int bambu_network_get_model_publish_url(void *agent_ptr, std::string *url)
 {
     LOG_CALL();
+    if (url) *url = "https://makerworld.com/upload";
     return 0;
 }
-int bambu_network_get_subtask(void *agent_ptr, BBLModelTask *task)
+int bambu_network_get_subtask(void *agent_ptr, BBLModelTask *task, OnGetSubTaskFn getsub_fn)
 {
     LOG_CALL();
+    if (getsub_fn && task) {
+        getsub_fn(task);
+    }
     return 0;
 }
 int bambu_network_get_model_mall_home_url(void *agent_ptr, std::string *url)
 {
     LOG_CALL();
+    if (url) *url = "https://makerworld.com";
     return 0;
 }
 int bambu_network_get_model_mall_detail_url(void *agent_ptr, std::string *url, std::string id)
 {
     LOG_CALL();
+    if (url) *url = "https://makerworld.com/models/" + id;
     return 0;
 }
 int bambu_network_get_my_profile(void *agent_ptr, std::string token, unsigned int *http_code, std::string *http_body)
@@ -450,5 +1105,185 @@ int bambu_network_track_get_property(void *agent_ptr, std::string name, std::str
 {
     LOG_CALL();
     value = "";
+    return 0;
+}
+
+#define BAMBU_COMPAT_STUB(name) \
+int name(...) \
+{ \
+    LOG_CALL(); \
+    write_diag(#name); \
+    return 0; \
+}
+
+int bambu_network_set_on_subscribe_failure_fn(void *agent_ptr, GetSubscribeFailureFn fn)
+{
+    LOG_CALL();
+    write_diag("bambu_network_set_on_subscribe_failure_fn");
+    on_subscribe_failure = fn;
+    return 0;
+}
+
+int bambu_network_set_on_user_message_fn(void *agent_ptr, OnMessageFn fn)
+{
+    LOG_CALL();
+    write_diag("bambu_network_set_on_user_message_fn");
+    on_user_message = fn;
+    return 0;
+}
+
+void bambu_network_install_device_cert(void *agent_ptr, std::string dev_id, bool lan_only)
+{
+    LOG_CALL();
+    write_diag(
+        "bambu_network_install_device_cert: dev_id=" + dev_id +
+        " lan_only=" + (lan_only ? "true" : "false")
+    );
+}
+
+void bambu_network_enable_multi_machine(void *agent_ptr, bool enable)
+{
+    LOG_CALL();
+    write_diag(std::string("bambu_network_enable_multi_machine: enable=") + (enable ? "true" : "false"));
+}
+
+int bambu_network_add_subscribe(void *agent_ptr, std::vector<std::string> dev_list)
+{
+    LOG_CALL();
+    write_diag("bambu_network_add_subscribe count=" + std::to_string(dev_list.size()));
+    return 0;
+}
+
+int bambu_network_del_subscribe(void *agent_ptr, std::vector<std::string> dev_list)
+{
+    LOG_CALL();
+    write_diag("bambu_network_del_subscribe count=" + std::to_string(dev_list.size()));
+    return 0;
+}
+
+BAMBU_COMPAT_STUB(bambu_network_report_consent)
+BAMBU_COMPAT_STUB(bambu_network_get_oss_config)
+BAMBU_COMPAT_STUB(bambu_network_get_my_token)
+BAMBU_COMPAT_STUB(bambu_network_track_remove_files)
+BAMBU_COMPAT_STUB(bambu_network_check_user_report)
+BAMBU_COMPAT_STUB(bambu_network_get_subtask_info)
+BAMBU_COMPAT_STUB(bambu_network_get_camera_url_for_golive)
+BAMBU_COMPAT_STUB(bambu_network_get_hms_snapshot)
+BAMBU_COMPAT_STUB(bambu_network_get_model_rating_id)
+BAMBU_COMPAT_STUB(bambu_network_put_model_mall_rating)
+BAMBU_COMPAT_STUB(bambu_network_get_model_instance_id)
+BAMBU_COMPAT_STUB(bambu_network_get_model_mall_rating)
+BAMBU_COMPAT_STUB(bambu_network_put_rating_picture_oss)
+BAMBU_COMPAT_STUB(bambu_network_del_rating_picture_oss)
+
+int bambu_network_get_user_tasks(void *agent_ptr, TaskQueryParams params, std::string *http_body)
+{
+    LOG_CALL();
+    write_diag(
+        "bambu_network_get_user_tasks: dev_id=" + params.dev_id +
+        " status=" + std::to_string(params.status) +
+        " offset=" + std::to_string(params.offset) +
+        " limit=" + std::to_string(params.limit)
+    );
+    if (http_body) {
+        *http_body = "{\"total\":0,\"hits\":[]}";
+    }
+    return 0;
+}
+
+int bambu_network_start_sdcard_print(void *agent_ptr, PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn)
+{
+    LOG_CALL_ARGS("%s %s %s", params.project_name.c_str(), params.filename.c_str(), params.dst_file.c_str());
+    log_print_params("bambu_network_start_sdcard_print", params);
+
+    const std::string plate_path = !params.dst_file.empty() ? params.dst_file : BambuPlugin::resolve_plate_metadata_path(params);
+    std::string remote_filename = BambuPlugin::basename_or_empty(plate_path);
+    if (remote_filename.empty()) {
+        remote_filename = BambuPlugin::resolve_remote_filename(params);
+    }
+
+    report_update_status(update_fn, PrintingStageCreate, BAMBU_NETWORK_SUCCESS, "Preparing print");
+    if (cancel_fn && cancel_fn()) {
+        report_update_status(update_fn, PrintingStageERROR, BAMBU_NETWORK_ERR_CANCELED, "Canceled");
+        return BAMBU_NETWORK_ERR_CANCELED;
+    }
+
+    report_update_status(update_fn, PrintingStageSending, BAMBU_NETWORK_SUCCESS, "Sending print command");
+    std::string json = BambuPlugin::build_project_file_command(params, remote_filename, plate_path);
+    write_diag("bambu_network_start_sdcard_print command=" + json);
+
+    const int send_result = bambu_network_rs_send(params.dev_id, json);
+    write_diag("bambu_network_start_sdcard_print send_result=" + std::to_string(send_result));
+    if (send_result != BAMBU_NETWORK_SUCCESS) {
+        report_update_status(update_fn, PrintingStageERROR, send_result, "Send failed");
+        return BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
+    }
+
+    report_update_status(update_fn, PrintingStageFinished, BAMBU_NETWORK_SUCCESS, "Print submitted");
+    return BAMBU_NETWORK_SUCCESS;
+}
+
+int bambu_network_update_cert(void *agent_ptr)
+{
+    LOG_CALL();
+    write_diag("bambu_network_update_cert");
+    return 0;
+}
+
+int bambu_network_set_server_callback(void *agent_ptr, OnServerErrFn fn)
+{
+    LOG_CALL();
+    write_diag("bambu_network_set_server_callback");
+    on_server_error = fn;
+    return 0;
+}
+
+int bambu_network_ping_bind(void *agent_ptr, std::string ping_code)
+{
+    LOG_CALL();
+    write_diag("bambu_network_ping_bind: code=" + ping_code);
+    return 0;
+}
+
+int bambu_network_bind_detect(void *agent_ptr, std::string dev_ip, std::string sec_link, detectResult &detect)
+{
+    LOG_CALL();
+    write_diag("bambu_network_bind_detect: dev_ip=" + dev_ip);
+    detect.result_msg = "success";
+    detect.command = "bind_detect";
+    detect.dev_id = selected_device;
+    detect.connect_type = "lan";
+    return 0;
+}
+
+int bambu_network_get_setting_list2(void *agent_ptr, std::string bundle_version, CheckFn chk_fn, ProgressFn pro_fn, WasCancelledFn cancel_fn)
+{
+    write_diag("bambu_network_get_setting_list2: bundle_version=" + bundle_version);
+    if (cancel_fn && cancel_fn()) {
+        return BAMBU_NETWORK_ERR_CANCELED;
+    }
+    if (pro_fn) {
+        pro_fn(100);
+    }
+    return 0;
+}
+
+int bambu_network_get_mw_user_preference(void *agent_ptr, std::function<void(std::string)> callback)
+{
+    LOG_CALL();
+    write_diag(
+        std::string("bambu_network_get_mw_user_preference callback=") +
+        (callback ? "set" : "null")
+    );
+    return 0;
+}
+
+int bambu_network_get_mw_user_4ulist(void *agent_ptr, int seed, int limit, std::function<void(std::string)> callback)
+{
+    LOG_CALL();
+    write_diag(
+        "bambu_network_get_mw_user_4ulist: seed=" + std::to_string(seed) +
+        " limit=" + std::to_string(limit)
+    );
     return 0;
 }

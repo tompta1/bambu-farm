@@ -3,6 +3,8 @@
 
 #include <string>
 #include <functional>
+#include <map>
+#include <vector>
 
 namespace BBL
 {
@@ -84,7 +86,7 @@ namespace BBL
 
 #define BAMBU_NETWORK_LIBRARY "bambu_networking"
 #define BAMBU_NETWORK_AGENT_NAME "bambu_network_agent"
-#define BAMBU_NETWORK_AGENT_VERSION "01.07.07.89" // works with Bambu Studio 1.7.7.89
+#define BAMBU_NETWORK_AGENT_VERSION "02.05.00.66" // default to the current Flatpak Bambu Studio version; override via env if needed
 // iot preset type strings
 #define IOT_PRINTER_TYPE_STRING "printer"
 #define IOT_FILAMENT_STRING "filament"
@@ -109,9 +111,11 @@ namespace BBL
     // http callbacks
     typedef std::function<void(unsigned http_code, std::string http_body)> OnHttpErrorFn;
     typedef std::function<std::string()> GetCountryCodeFn;
+    typedef std::function<void(std::string topic)> GetSubscribeFailureFn;
     // print callbacks
     typedef std::function<void(int status, int code, std::string msg)> OnUpdateStatusFn;
     typedef std::function<bool()> WasCancelledFn;
+    typedef std::function<bool(int status, std::string job_info)> OnWaitFn;
     // local callbacks
     typedef std::function<void(std::string dev_info_json_str)> OnMsgArrivedFn;
     // queue call to main thread
@@ -121,6 +125,8 @@ namespace BBL
     typedef std::function<void(int retcode, std::string info)> LoginFn;
     typedef std::function<void(int result, std::string info)> ResultFn;
     typedef std::function<bool()> CancelFn;
+    typedef std::function<bool(std::map<std::string, std::string> info)> CheckFn;
+    typedef std::function<void(std::string url, int status)> OnServerErrFn;
 
     enum SendingPrintJobStage
     {
@@ -129,8 +135,10 @@ namespace BBL
         PrintingStageWaiting = 2,
         PrintingStageSending = 3,
         PrintingStageRecord = 4,
-        PrintingStageFinished = 5,
-        PrintingStageERROR = 6,
+        PrintingStageWaitPrinter = 5,
+        PrintingStageFinished = 6,
+        PrintingStageERROR = 7,
+        PrintingStageLimit = 8,
     };
 
     enum PublishingStage
@@ -158,6 +166,18 @@ namespace BBL
         ConnectStatusLost = 2,
     };
 
+    struct detectResult
+    {
+        std::string result_msg;
+        std::string command;
+        std::string dev_id;
+        std::string model_id;
+        std::string dev_name;
+        std::string version;
+        std::string bind_state;
+        std::string connect_type;
+    };
+
     /* print job*/
     struct PrintParams
     {
@@ -172,14 +192,19 @@ namespace BBL
         std::string ftp_folder;
         std::string ftp_file;
         std::string ftp_file_md5;
+        std::string nozzle_mapping;
         std::string ams_mapping;
+        std::string ams_mapping2;
         std::string ams_mapping_info;
+        std::string nozzles_info;
         std::string connection_type;
         std::string comments;
         int origin_profile_id = 0;
+        int stl_design_id = 0;
         std::string origin_model_id;
         std::string print_type;
         std::string dst_file;
+        std::string dev_name;
 
         /* access options */
         std::string dev_ip;
@@ -197,6 +222,19 @@ namespace BBL
         bool task_use_ams;
         std::string task_bed_type;
         std::string extra_options;
+        int auto_bed_leveling = 0;
+        int auto_flow_cali = 0;
+        int auto_offset_cali = 0;
+        bool task_ext_change_assist = false;
+        bool try_emmc_print = false;
+    };
+
+    struct TaskQueryParams
+    {
+        std::string dev_id;
+        int status = 0;
+        int offset = 0;
+        int limit = 20;
     };
 
     struct PublishParams

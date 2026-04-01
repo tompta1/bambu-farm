@@ -18,8 +18,9 @@ fn main() {
 
     cxx_build::bridge("src/api.rs")
         .file("cpp/api.cpp")
+        .file("cpp/print_job.cpp")
         .include("cpp")
-        .flag_if_supported("-std=c++11")
+        .flag_if_supported("-std=c++17")
         .flag_if_supported("-Wno-unused-parameter")
         // .link_lib_modifier("+whole-archive")
         .compile("bambu_networking_api");

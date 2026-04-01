@@ -12,11 +12,65 @@ Unfortunately, the C++ ecosystem is full of footguns, and dynamic linking is a s
 
 ## What's the current status?
 
-Currently you can control and monitor the printer's vitals, jog and home the axes and start print jobs. You can't view the camera feed yet. The implementation is very bare-bones and it's not ready for general use.
+Currently you can control and monitor the printer's vitals, jog and home the axes and start print jobs. The current OSS plugin work is focused on Linux arm64 builds used by Flatpak Bambu Studio and Orca-style plugin ABI compatibility. You can't view the camera feed yet. The implementation is still bare-bones and not ready for general use.
 
 ## What do I need to build/run it?
 
 Off the top of my head, you'll need Rust/Cargo, OpenSSL (development packages), GNU Make, a C/C++ build system, a protocol buffers compiler (protoc), cURL, and a little bit of determination to fix any issues that come up. Some of my projects are very highly polished, but this is not one of them.
+
+## Local configuration
+
+The server reads `bambu-farm-server/bambufarm.toml` when you run it from the repo, and that file is intentionally ignored by git. Start from `bambu-farm-server/bambufarm_example.toml` and fill in your own printer details locally.
+
+## Building the plugin
+
+Build the shared libraries:
+
+```sh
+make -C bambu-farm-client shared
+```
+
+That produces:
+
+- `bambu-farm-client/target/debug/shared/libbambu_networking.so`
+- `bambu-farm-client/target/debug/shared/libBambuSource.so`
+
+Install them into the host and Flatpak plugin directories:
+
+```sh
+cd bambu-farm-client
+./install-flatpak-plugin.sh install
+```
+
+The install helper resolves paths relative to the repo or a release bundle, and copies `bambufarm.toml` if present, otherwise `bambufarm_example.toml`.
+
+## GitHub Actions and release artifacts
+
+The repository includes an ARM workflow at `.github/workflows/arm-plugin.yml` that builds on GitHub-hosted `ubuntu-24.04-arm` runners, uploads a packaged artifact for each run, and publishes the `*.tar.gz` bundle on tags matching `v*`.
+
+## Real printer integration test
+
+There is an opt-in real-printer upload test in `bambu-farm-server/src/main.rs`. It is ignored by default and only runs when you explicitly provide printer credentials through environment variables.
+
+Required environment variables:
+
+- `BAMBU_FARM_RUN_PRINTER_TESTS=1`
+- `BAMBU_FARM_TEST_PRINTER_DEV_ID`
+- `BAMBU_FARM_TEST_PRINTER_HOST`
+- `BAMBU_FARM_TEST_PRINTER_PASSWORD`
+
+Optional environment variables:
+
+- `BAMBU_FARM_TEST_PRINTER_NAME`
+- `BAMBU_FARM_TEST_PRINTER_MODEL`
+
+Run it with:
+
+```sh
+cargo test --manifest-path bambu-farm-server/Cargo.toml upload_file_stream_rpc_reaches_real_printer -- --ignored --nocapture
+```
+
+The test uploads a small unique text file through the real gRPC -> server -> FTPS path and then attempts to delete it from the printer.
 
 ## Get involved!
 

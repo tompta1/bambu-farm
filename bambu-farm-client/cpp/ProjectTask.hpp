@@ -4,6 +4,7 @@
 #include <map>
 #include <vector>
 #include <string>
+#include <functional>
 #include <memory>
 #include <boost/thread.hpp>
 #include <boost/filesystem/fstream.hpp>
@@ -252,6 +253,8 @@ namespace Slic3r
 
         int parse_content_json(std::string json);
     };
+
+    typedef std::function<void(BBLModelTask *subtask)> OnGetSubTaskFn;
 
     class BBLProfile
     {
