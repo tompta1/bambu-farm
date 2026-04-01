@@ -1,8 +1,8 @@
 # Bambu Farm 🧑🏽‍🌾
 
-Run your own cloud service for Bambu Labs printers and unlock the full potential of LAN mode!
+Run your own LAN-first replacement for Bambu's proprietary networking plugin and keep Bambu Studio / Orca-style printer workflows usable without the vendor cloud.
 
-As of writing (September 2023) Bambu Labs has not released the source code for the `libbambu_networking.so` shared library that they link with to provide the full functionality of Bambu Studio, forked from the AGPLv3 Prusa Slicer. Until they choose to release the code on their own or somebody with deep pockets decides to sue them, you can use this project to provide your own LAN-mode "cloud" printing service. Or at least, you could, *if* you help me figure out the finishing touches like auth, bugfixes, replacing `.unwrap()`s with error handling, and general quality of life features. 👀
+Bambu Studio loads a plugin called `libbambu_networking.so` at runtime. The upstream binary is proprietary. This repository provides an open replacement plugin plus a local Rust sidecar server for the parts that are awkward or unsafe to implement directly inside the shared library.
 
 ## How does it work?
 
@@ -12,11 +12,57 @@ Unfortunately, the C++ ecosystem is full of footguns, and dynamic linking is a s
 
 ## What's the current status?
 
-Currently you can control and monitor the printer's vitals, jog and home the axes and start print jobs. The current OSS plugin work is focused on Linux arm64 builds used by Flatpak Bambu Studio and Orca-style plugin ABI compatibility. You can't view the camera feed yet. The implementation is still bare-bones and not ready for general use.
+Current `main` is focused on Linux `aarch64` / ARM64 usage, especially Flatpak Bambu Studio and Orca-style plugin ABI compatibility.
+
+What currently works in LAN mode:
+
+- printer discovery and connect/disconnect
+- printer status monitoring and live state updates
+- local print submission, including larger streamed `.3mf` uploads
+- AMS mapping forwarding for print jobs
+- LAN login / logout UI compatibility
+- reconnecting the last selected printer on Studio startup
+- live camera feed in the device tab
+- storage browsing through the LAN tunnel
+- timelapse listing, thumbnails, and downloads
+- model listing from the printer SD card
+- Linux ARM release packaging in GitHub Actions
+
+What is still limited or incomplete:
+
+- cloud and MakerWorld features are mostly stubbed or intentionally unsupported
+- storage support is aimed at the Studio paths exercised so far, not full parity with the vendor plugin
+- timelapse and large file downloads work, but the tunnel/file APIs have only been hardened for the tested flows
+- the codebase still has a lot of ABI-compatibility glue and global state that should be refactored
+- the project is functional for LAN usage, but still not polished as a general consumer-ready replacement
+
+If you need vendor-cloud workflows, account sync, or full MakerWorld support, this project does not provide that today.
 
 ## What do I need to build/run it?
 
-Off the top of my head, you'll need Rust/Cargo, OpenSSL (development packages), GNU Make, a C/C++ build system, a protocol buffers compiler (protoc), cURL, and a little bit of determination to fix any issues that come up. Some of my projects are very highly polished, but this is not one of them.
+You need, at minimum:
+
+- Rust and Cargo
+- GNU Make
+- a C/C++ toolchain
+- `protoc`
+- `curl`
+- OpenSSL development headers
+- Boost development headers
+- MessagePack C++ headers
+
+On Debian/Ubuntu-like systems that usually means something close to:
+
+```sh
+sudo apt-get install -y \
+  build-essential \
+  curl \
+  libboost-all-dev \
+  libmsgpack-cxx-dev \
+  libprotobuf-dev \
+  libssl-dev \
+  protobuf-compiler
+```
 
 ## Local configuration
 
@@ -43,6 +89,27 @@ cd bambu-farm-client
 ```
 
 The install helper resolves paths relative to the repo or a release bundle, and copies `bambufarm.toml` if present, otherwise `bambufarm_example.toml`.
+
+## Running the server
+
+Start the local server from the repo root with:
+
+```sh
+cargo run --manifest-path bambu-farm-server/Cargo.toml
+```
+
+In normal local development the client plugin talks to the server over localhost gRPC.
+
+## Testing
+
+Helper and server tests:
+
+```sh
+make -C bambu-farm-client test-helpers
+cargo test --manifest-path bambu-farm-server/Cargo.toml
+```
+
+There is also an opt-in real-printer integration test for upload coverage. See the section below for the required environment variables.
 
 ## GitHub Actions and release artifacts
 
@@ -71,6 +138,23 @@ cargo test --manifest-path bambu-farm-server/Cargo.toml upload_file_stream_rpc_r
 ```
 
 The test uploads a small unique text file through the real gRPC -> server -> FTPS path and then attempts to delete it from the printer.
+
+## Known gaps / TODO
+
+Highest-value follow-up work:
+
+- reduce and simplify the ABI-compatibility layer in the client plugin
+- replace remaining global/shared state with cleaner session-oriented code
+- expand automated integration coverage beyond upload and storage paths
+- document supported and unsupported Studio/Orca workflows more precisely
+- improve non-LAN feature behavior so unsupported flows fail more explicitly instead of acting like partial stubs
+
+Likely unsupported or intentionally out of scope for now:
+
+- vendor cloud account features
+- MakerWorld browsing, sync, and publishing
+- full parity with the proprietary plugin across every UI surface
+- non-Linux packaging and release support
 
 ## Get involved!
 
