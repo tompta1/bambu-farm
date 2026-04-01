@@ -40,6 +40,9 @@ pub mod bambu_farm {
 const GRPC_MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
 const CONTROL_CMD_LIST_INFO: i64 = 0x0001;
 const CONTROL_CMD_REQUEST_MEDIA_ABILITY: i64 = 0x0007;
+const MQTT_MIN_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const MQTT_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+const MQTT_KEEP_ALIVE: Duration = Duration::from_secs(20);
 
 fn remote_media_dir(requested_type: &str) -> Option<&'static str> {
     match requested_type {
@@ -479,11 +482,26 @@ impl BambuFarm for Farm {
             };
 
             let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(10);
+            let report_topic = format!("device/{}/report", request.get_ref().dev_id);
+            let request_topic = format!("device/{}/request", request.get_ref().dev_id);
+            let callback_dev_id = dev_id.clone();
+            let callback_report_topic = report_topic.clone();
+            client.set_connected_callback(move |cli| {
+                info!("MQTT connected for {}", callback_dev_id);
+                let _ = cli.subscribe(&callback_report_topic, 0);
+            });
+            let lost_dev_id = dev_id.clone();
+            client.set_connection_lost_callback(move |_| {
+                warn!("MQTT connection lost for {}", lost_dev_id);
+            });
 
             let connection_token = client.connect(Some(
                 ConnectOptionsBuilder::new()
                     .user_name("bblp")
                     .password(&printer.password)
+                    .keep_alive_interval(MQTT_KEEP_ALIVE)
+                    .clean_session(false)
+                    .automatic_reconnect(MQTT_MIN_RECONNECT_DELAY, MQTT_MAX_RECONNECT_DELAY)
                     .ssl_options(
                         SslOptionsBuilder::new()
                             .verify(false)
@@ -497,10 +515,7 @@ impl BambuFarm for Farm {
                 return Err(Status::unavailable("Could not connect to printer"));
             }
 
-            if let Err(e) = client
-                .subscribe(format!("device/{}/report", request.get_ref().dev_id), 0)
-                .await
-            {
+            if let Err(e) = client.subscribe(&report_topic, 0).await {
                 error!("MQTT subscribe failed for {}: {}", dev_id, e);
                 return Err(Status::internal("Failed to subscribe to printer topic"));
             }
@@ -525,8 +540,9 @@ impl BambuFarm for Farm {
                             }
                         }
                         _ => {
-                            warn!("MQTT stream ended for {}", dev_id);
-                            break;
+                            warn!("MQTT stream ended for {}; waiting for auto-reconnect", dev_id);
+                            sleep(Duration::from_secs(1)).await;
+                            continue;
                         }
                     }
                 }
@@ -551,7 +567,7 @@ impl BambuFarm for Farm {
                     info!("Publishing to device/{}/request", publish_dev_id);
                     if let Err(e) = client
                         .publish(Message::new(
-                            format!("device/{}/request", publish_dev_id),
+                            request_topic.clone(),
                             recv_message.data,
                             0,
                         ))
