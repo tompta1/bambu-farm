@@ -715,7 +715,7 @@ static bool printer_json_matches_selected_device(const std::string &json)
 
 static void connect_selected_device_if_pending(const std::string &json)
 {
-    if (!auto_connect_pending.load() || !lan_user_logged_in.load()) {
+    if (!auto_connect_pending.load()) {
         return;
     }
     if (!printer_json_matches_selected_device(json)) {
@@ -1269,6 +1269,11 @@ void Bambu_FreeLogMsg(tchar const *msg)
 void bambu_network_cb_printer_available(const std::string &json) {
     const std::string effective_json = apply_printer_name_override(json);
     const std::string dev_id = json_string_field(effective_json, "dev_id");
+    write_diag(
+        "bambu_network_cb_printer_available: dev_id=" + dev_id +
+        " callback=" + (on_msg_arrived ? "set" : "null") +
+        " preview=\"" + preview_payload(effective_json, 512) + "\""
+    );
     if (!dev_id.empty()) {
         std::lock_guard<std::mutex> lock(printer_name_overrides_mutex);
         last_printer_json_by_id[dev_id] = effective_json;
@@ -1404,6 +1409,16 @@ int bambu_network_set_on_ssdp_msg_fn(void *agent_ptr, OnMsgArrivedFn fn)
 {
     LOG_CALL();
     on_msg_arrived = fn;
+    write_diag(std::string("bambu_network_set_on_ssdp_msg_fn: callback=") + (fn ? "set" : "null"));
+    if (on_msg_arrived) {
+        std::lock_guard<std::mutex> lock(printer_name_overrides_mutex);
+        for (const auto &[dev_id, json] : last_printer_json_by_id) {
+            write_diag("bambu_network_set_on_ssdp_msg_fn: replay dev_id=" + dev_id);
+            on_msg_arrived(json);
+        }
+        write_diag("bambu_network_set_on_ssdp_msg_fn: requesting Rust discovery refresh");
+        bambu_network_rs_refresh_available_printers();
+    }
     return 0;
 }
 int bambu_network_set_on_user_login_fn(void *agent_ptr, OnUserLoginFn fn)
@@ -1458,6 +1473,10 @@ int bambu_network_set_on_local_connect_fn(void *agent_ptr, OnLocalConnectedFn fn
 {
     LOG_CALL();
     on_local_connect = fn;
+    if (on_local_connect && !selected_device.empty() && printer_connected.load()) {
+        write_diag("bambu_network_set_on_local_connect_fn: signaling existing printer " + selected_device);
+        on_local_connect(ConnectStatusOk, selected_device, "Connected");
+    }
     return 0;
 }
 int bambu_network_set_on_local_message_fn(void *agent_ptr, OnMessageFn fn)

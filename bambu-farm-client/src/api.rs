@@ -158,6 +158,7 @@ mod ffi {
     extern "Rust" {
         pub fn bambu_network_rs_init();
         pub fn bambu_network_rs_log_debug(message: String);
+        pub fn bambu_network_rs_refresh_available_printers();
         pub fn bambu_network_rs_connect(device_id: String) -> i32;
         pub fn bambu_network_rs_disconnect(device_id: String) -> i32;
         pub fn bambu_network_rs_send(device_id: String, data: String) -> i32;
@@ -615,6 +616,84 @@ fn emit_disconnect_event_if_active(device_id: &str, generation: u64, status: i32
     }
 }
 
+fn emit_available_printer(printer: bambu_farm::PrinterOption) {
+    let printer_host = printer_host_for_device(&printer.dev_id).unwrap_or_else(|| "127.0.0.1".into());
+    bambu_network_rs_log_debug(format!(
+        "bambu_network_rs_emit_available_printer: dev_id={} dev_name={} model={} host={}",
+        printer.dev_id, printer.dev_name, printer.model, printer_host
+    ));
+    let_cxx_string!(
+        json = format!(
+            "{{
+                \"dev_name\": \"{}\",
+                \"dev_id\": \"{}\",
+                \"dev_ip\": \"{}\",
+                \"dev_type\": \"{}\",
+                \"dev_signal\": \"0dbm\",
+                \"connect_type\": \"lan\",
+                \"bind_state\": \"free\"
+            }}",
+            printer.dev_name, printer.dev_id, printer_host, printer.model
+        )
+        .trim()
+        .as_bytes()
+    );
+    bambu_network_cb_printer_available(&json);
+}
+
+async fn refresh_available_printers_once() {
+    bambu_network_rs_log_debug("bambu_network_rs_refresh_available_printers: begin".into());
+    let mut client = match connect_client().await {
+        Ok(client) => {
+            bambu_network_rs_log_debug("bambu_network_rs_refresh_available_printers: connected".into());
+            client
+        }
+        Err(err) => {
+            bambu_network_rs_log_debug(format!(
+                "bambu_network_rs_refresh_available_printers: connect_failed error={}",
+                err
+            ));
+            return;
+        }
+    };
+
+    let request = Request::new(PrinterOptionRequest {});
+    let mut stream = match client.get_available_printers(request).await {
+        Ok(stream) => {
+            bambu_network_rs_log_debug("bambu_network_rs_refresh_available_printers: stream_opened".into());
+            stream.into_inner()
+        }
+        Err(err) => {
+            bambu_network_rs_log_debug(format!(
+                "bambu_network_rs_refresh_available_printers: request_failed error={}",
+                err
+            ));
+            return;
+        }
+    };
+
+    match stream.next().await {
+        Some(Ok(list)) => {
+            bambu_network_rs_log_debug(format!(
+                "bambu_network_rs_refresh_available_printers: received options={}",
+                list.options.len()
+            ));
+            for printer in list.options {
+                emit_available_printer(printer);
+            }
+        }
+        Some(Err(err)) => {
+            bambu_network_rs_log_debug(format!(
+                "bambu_network_rs_refresh_available_printers: stream_item_failed error={}",
+                err
+            ));
+        }
+        None => {
+            bambu_network_rs_log_debug("bambu_network_rs_refresh_available_printers: stream_ended_without_data".into());
+        }
+    }
+}
+
 pub fn bambu_network_rs_init() {
     env_logger::init();
     debug!("Calling network init");
@@ -661,26 +740,16 @@ pub fn bambu_network_rs_init() {
                     }
                 };
                 for printer in list.options {
-                    let_cxx_string!(
-                        json = format!(
-                            "{}
-                        \"dev_name\": \"{}\",
-                        \"dev_id\": \"{}\",
-                        \"dev_ip\": \"127.0.0.1\",
-                        \"dev_type\": \"{}\",
-                        \"dev_signal\": \"0dbm\",
-                        \"connect_type\": \"lan\",
-                        \"bind_state\": \"free\"
-                        {}",
-                            "{", printer.dev_name, printer.dev_id, printer.model, "}"
-                        )
-                        .trim()
-                        .as_bytes()
-                    );
-                    bambu_network_cb_printer_available(&json);
+                    emit_available_printer(printer);
                 }
             }
         }
+    });
+}
+
+pub fn bambu_network_rs_refresh_available_printers() {
+    RUNTIME.spawn(async {
+        refresh_available_printers_once().await;
     });
 }
 
