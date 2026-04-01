@@ -25,6 +25,7 @@ jobs:
             build-essential \
             curl \
             libboost-all-dev \
+            libmsgpack-cxx-dev \
             libprotobuf-dev \
             libssl-dev \
             protobuf-compiler
