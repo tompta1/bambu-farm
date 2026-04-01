@@ -1,15 +1,18 @@
 use bambu_farm::PrinterOption;
 use bambu_farm::{
-    bambu_farm_server::BambuFarm, ConnectRequest, PrinterOptionList, PrinterOptionRequest,
-    RecvMessage, SendMessageRequest, SendMessageResponse, UploadFileChunk, UploadFileRequest,
-    UploadFileResponse,
+    bambu_farm_server::BambuFarm, ConnectRequest, ControlMessageRequest, ControlMessageResponse,
+    PrinterOptionList, PrinterOptionRequest, RecvMessage, SendMessageRequest, SendMessageResponse,
+    UploadFileChunk, UploadFileRequest, UploadFileResponse,
 };
 use config::{Config, ConfigError, Value};
 use log::{error, info, warn};
 use paho_mqtt::{
     AsyncClient, ConnectOptionsBuilder, CreateOptionsBuilder, Message, SslOptionsBuilder,
 };
+use serde_json::{json, Value as JsonValue};
+use std::convert::TryFrom;
 use suppaftp::native_tls::TlsConnector;
+use suppaftp::list::File as FtpListFile;
 use suppaftp::types::FileType;
 use suppaftp::{NativeTlsConnector, NativeTlsFtpStream};
 use tempfile::NamedTempFile;
@@ -35,6 +38,29 @@ pub mod bambu_farm {
 }
 
 const GRPC_MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
+const CONTROL_CMD_LIST_INFO: i64 = 0x0001;
+const CONTROL_CMD_REQUEST_MEDIA_ABILITY: i64 = 0x0007;
+
+fn remote_media_dir(requested_type: &str) -> Option<&'static str> {
+    match requested_type {
+        "timelapse" => Some("timelapse"),
+        "video" => Some("ipcam"),
+        _ => None,
+    }
+}
+
+fn control_response(sequence: i64, result: i64, reply: JsonValue) -> String {
+    json!({
+        "result": result,
+        "sequence": sequence,
+        "reply": reply
+    })
+    .to_string()
+}
+
+fn control_error_response(sequence: i64, result: i64) -> String {
+    control_response(sequence, result, json!({}))
+}
 
 type UploadHandler =
     Arc<dyn Fn(&Printer, &str, &Path, usize) -> Result<bool, Status> + Send + Sync + 'static>;
@@ -109,6 +135,128 @@ fn connect_rust_ftps(printer: &Printer) -> Result<NativeTlsFtpStream, String> {
                     implicit_err, explicit_err
                 )
             })
+        }
+    }
+}
+
+fn list_files_via_ftps(printer: &Printer, requested_type: &str) -> Result<JsonValue, String> {
+    if requested_type != "model" && requested_type != "timelapse" && requested_type != "video" {
+        return Ok(json!({ "file_lists": [] }));
+    }
+    let remote_dir = remote_media_dir(requested_type);
+
+    let mut ftp_stream = connect_rust_ftps(printer)?;
+    let raw_entries = match ftp_stream.mlsd(remote_dir) {
+        Ok(entries) => entries,
+        Err(mlsd_err) => {
+            info!(
+                "MLSD failed for printer={} type={} dir={}: {}; reconnecting and falling back to LIST",
+                printer.ip,
+                requested_type,
+                remote_dir.unwrap_or("/"),
+                mlsd_err
+            );
+            let _ = ftp_stream.quit();
+            let mut fallback_stream = connect_rust_ftps(printer)?;
+            let entries = fallback_stream
+                .list(remote_dir)
+                .map_err(|list_err| format!("failed to list remote files: {}", list_err))?;
+            let _ = fallback_stream.quit();
+            entries
+        }
+    };
+
+    let mut entries = Vec::new();
+
+    for line in raw_entries {
+        let file = match FtpListFile::try_from(line.as_str()) {
+            Ok(file) => file,
+            Err(parse_err) => {
+                warn!("failed to parse FTPS listing line {:?}: {}", line, parse_err);
+                continue;
+            }
+        };
+        if !file.is_file() {
+            continue;
+        }
+        let name = file.name().to_string();
+        if requested_type == "model" {
+            if name.starts_with('.') {
+                continue;
+            }
+            if name == "check_access_code.txt" || name == "verify_job" {
+                continue;
+            }
+            if !(name.ends_with(".gcode.3mf") || name.ends_with(".3mf")) {
+                continue;
+            }
+        }
+        let remote_path = match remote_dir {
+            Some(remote_dir) => format!("{}/{}", remote_dir, file.name()),
+            None => file.name().to_string(),
+        };
+        let modified = file
+            .modified()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        entries.push(json!({
+            "name": name,
+            "path": remote_path,
+            "time": modified,
+            "size": file.size() as u64
+        }));
+    }
+
+    let _ = ftp_stream.quit();
+    info!(
+        "LIST_INFO succeeded for printer={} type={} count={}",
+        printer.id,
+        requested_type,
+        entries.len()
+    );
+    Ok(json!({ "file_lists": entries }))
+}
+
+fn handle_control_message(printer: &Printer, data: &str) -> String {
+    let root: JsonValue = match serde_json::from_str(data) {
+        Ok(root) => root,
+        Err(err) => {
+            warn!("control request parse failed: {}", err);
+            return control_error_response(0, 2);
+        }
+    };
+
+    let sequence = root.get("sequence").and_then(JsonValue::as_i64).unwrap_or(0);
+    let cmdtype = root.get("cmdtype").and_then(JsonValue::as_i64).unwrap_or(-1);
+    let req = root.get("req").cloned().unwrap_or_else(|| json!({}));
+
+    match cmdtype {
+        CONTROL_CMD_REQUEST_MEDIA_ABILITY => {
+            control_response(sequence, 0, json!({ "storage": ["internal"] }))
+        }
+        CONTROL_CMD_LIST_INFO => {
+            let requested_type = req
+                .get("type")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("model");
+            match list_files_via_ftps(printer, requested_type) {
+                Ok(reply) => control_response(sequence, 0, reply),
+                Err(err) => {
+                    warn!(
+                        "LIST_INFO failed for printer={} type={}: {}",
+                        printer.id, requested_type, err
+                    );
+                    control_error_response(sequence, 17)
+                }
+            }
+        }
+        _ => {
+            info!(
+                "unsupported control cmdtype={} for printer={} payload={}",
+                cmdtype, printer.id, data
+            );
+            control_error_response(sequence, 18)
         }
     }
 }
@@ -440,6 +588,18 @@ impl BambuFarm for Farm {
             Ok(_) => Ok(Response::new(SendMessageResponse { success: true })),
             Err(_) => Ok(Response::new(SendMessageResponse { success: false })),
         }
+    }
+
+    async fn send_control_message(
+        &self,
+        request: Request<ControlMessageRequest>,
+    ) -> Result<Response<ControlMessageResponse>, Status> {
+        let req = request.into_inner();
+        let printer = self.lookup_printer(&req.dev_id)?;
+        let data = spawn_blocking(move || handle_control_message(&printer, &req.data))
+            .await
+            .map_err(|_| Status::internal("Control task panicked"))?;
+        Ok(Response::new(ControlMessageResponse { data }))
     }
 
     async fn upload_file(

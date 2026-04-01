@@ -5,13 +5,17 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <cstdint>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <deque>
 #include <execinfo.h>
 #include <mutex>
+#include <memory>
 #include <fstream>
 #include <filesystem>
+#include <regex>
 #include <thread>
 #include <unordered_map>
 
@@ -53,6 +57,22 @@ static std::unordered_map<std::string, std::string> printer_name_overrides;
 static std::unordered_map<std::string, std::string> last_printer_json_by_id;
 static std::mutex local_print_context_mutex;
 static void persist_local_print_contexts();
+static std::string last_tunnel_error;
+static std::string preview_payload(const std::string &message, size_t limit = 1024);
+static constexpr size_t kTunnelDownloadChunkSize = 4 * 1024 * 1024;
+
+struct CompatTunnel
+{
+    std::string url;
+    std::string device_id;
+    Logger logger{nullptr};
+    void *logger_context{nullptr};
+    bool opened{false};
+    bool control_stream_started{false};
+    std::mutex mutex;
+    std::deque<std::string> queued_responses;
+    std::string active_response;
+};
 
 struct LocalPrintContext
 {
@@ -71,6 +91,149 @@ struct LocalPrintContext
 static std::unordered_map<std::string, LocalPrintContext> local_print_contexts;
 
 static void write_diag(const std::string &message);
+
+static CompatTunnel *as_compat_tunnel(Bambu_Tunnel tunnel)
+{
+    return reinterpret_cast<CompatTunnel *>(tunnel);
+}
+
+static std::string bambu_query_param(const std::string &url, const std::string &key)
+{
+    const std::string needle = key + "=";
+    const size_t query_pos = url.find('?');
+    size_t pos = url.find(needle, query_pos == std::string::npos ? 0 : query_pos + 1);
+    if (pos == std::string::npos) {
+        return {};
+    }
+    pos += needle.size();
+    const size_t end = url.find('&', pos);
+    return url.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+}
+
+static void compat_tunnel_log(CompatTunnel *tunnel, const std::string &message)
+{
+    write_diag(message);
+    if (!tunnel || !tunnel->logger) {
+        return;
+    }
+    char *copy = static_cast<char *>(std::malloc(message.size() + 1));
+    if (!copy) {
+        return;
+    }
+    std::memcpy(copy, message.c_str(), message.size());
+    copy[message.size()] = '\0';
+    tunnel->logger(tunnel->logger_context, 0, copy);
+}
+
+static std::string json_escape(const std::string &value)
+{
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    for (unsigned char ch : value) {
+        switch (ch) {
+        case '\\':
+            escaped += "\\\\";
+            break;
+        case '"':
+            escaped += "\\\"";
+            break;
+        case '\b':
+            escaped += "\\b";
+            break;
+        case '\f':
+            escaped += "\\f";
+            break;
+        case '\n':
+            escaped += "\\n";
+            break;
+        case '\r':
+            escaped += "\\r";
+            break;
+        case '\t':
+            escaped += "\\t";
+            break;
+        default:
+            if (ch < 0x20) {
+                char buf[7];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", ch);
+                escaped += buf;
+            } else {
+                escaped.push_back(static_cast<char>(ch));
+            }
+            break;
+        }
+    }
+    return escaped;
+}
+
+static bool extract_json_integer(const std::string &json, const char *key, std::uint64_t &value)
+{
+    const std::regex pattern(std::string("\"") + key + "\":([0-9]+)");
+    std::smatch match;
+    if (!std::regex_search(json, match, pattern) || match.size() < 2) {
+        return false;
+    }
+    value = std::strtoull(match[1].str().c_str(), nullptr, 10);
+    return true;
+}
+
+static std::string extract_json_string(const std::string &json, const char *key)
+{
+    const std::regex pattern(std::string("\"") + key + "\":\"([^\"]*)\"");
+    std::smatch match;
+    if (!std::regex_search(json, match, pattern) || match.size() < 2) {
+        return {};
+    }
+    return match[1].str();
+}
+
+static std::vector<std::string> split_file_download_response_frames(const std::string &response_bytes)
+{
+    const size_t separator = response_bytes.find("\n\n");
+    if (separator == std::string::npos) {
+        return {response_bytes};
+    }
+
+    const std::string header = response_bytes.substr(0, separator);
+    const std::string payload = response_bytes.substr(separator + 2);
+    if (payload.size() <= kTunnelDownloadChunkSize) {
+        return {response_bytes};
+    }
+
+    std::uint64_t sequence = 0;
+    std::uint64_t total = static_cast<std::uint64_t>(payload.size());
+    if (!extract_json_integer(header, "sequence", sequence)) {
+        return {response_bytes};
+    }
+    extract_json_integer(header, "total", total);
+
+    const std::string file_md5 = extract_json_string(header, "file_md5");
+    const std::string ftp_file_md5 = extract_json_string(header, "ftp_file_md5");
+    const std::string path = extract_json_string(header, "path");
+
+    std::vector<std::string> frames;
+    frames.reserve((payload.size() + kTunnelDownloadChunkSize - 1) / kTunnelDownloadChunkSize);
+    for (size_t offset = 0; offset < payload.size(); offset += kTunnelDownloadChunkSize) {
+        const size_t chunk_size = std::min(kTunnelDownloadChunkSize, payload.size() - offset);
+        const int result = (offset + chunk_size) < payload.size() ? 1 : 0;
+        std::string frame_header =
+            "{\"result\":" + std::to_string(result) +
+            ",\"sequence\":" + std::to_string(sequence) +
+            ",\"reply\":{\"size\":" + std::to_string(chunk_size) +
+            ",\"offset\":" + std::to_string(offset) +
+            ",\"total\":" + std::to_string(total) +
+            ",\"file_md5\":\"" + json_escape(file_md5) +
+            "\",\"ftp_file_md5\":\"" + json_escape(ftp_file_md5) +
+            "\",\"path\":\"" + json_escape(path) + "\"}}";
+        std::string frame;
+        frame.reserve(frame_header.size() + 2 + chunk_size);
+        frame += frame_header;
+        frame += "\n\n";
+        frame.append(payload.data() + offset, chunk_size);
+        frames.emplace_back(std::move(frame));
+    }
+    return frames;
+}
 
 static std::string selected_device_state_path()
 {
@@ -329,31 +492,69 @@ static bool lookup_local_print_context_by_subtask_id(const std::string &subtask_
 
 static std::string rewrite_local_print_status_message(const std::string &device_id, const std::string &message)
 {
+    const auto inject_file_capability = [](const std::string &input) -> std::string {
+        const size_t print_key_pos = input.find("\"print\"");
+        if (print_key_pos == std::string::npos) {
+            return input;
+        }
+        const size_t print_object_start = input.find('{', print_key_pos);
+        if (print_object_start == std::string::npos) {
+            return input;
+        }
+
+        const size_t ipcam_key_pos = input.find("\"ipcam\"", print_object_start);
+        if (ipcam_key_pos != std::string::npos) {
+            const size_t ipcam_object_start = input.find('{', ipcam_key_pos);
+            if (ipcam_object_start != std::string::npos) {
+                const size_t ipcam_object_end = input.find('}', ipcam_object_start);
+                if (ipcam_object_end != std::string::npos) {
+                    const std::string ipcam_body =
+                        input.substr(ipcam_object_start, ipcam_object_end - ipcam_object_start);
+                    if (ipcam_body.find("\"file\"") == std::string::npos) {
+                        std::string rewritten = input;
+                        rewritten.insert(
+                            ipcam_object_start + 1,
+                            "\"file\":{\"local\":\"local\",\"remote\":\"none\",\"model_download\":\"disabled\"},");
+                        return rewritten;
+                    }
+                }
+            }
+            return input;
+        }
+
+        std::string rewritten = input;
+        rewritten.insert(
+            print_object_start + 1,
+            "\"ipcam\":{\"file\":{\"local\":\"local\",\"remote\":\"none\",\"model_download\":\"disabled\"}},");
+        return rewritten;
+    };
+
+    const std::string capability_message = inject_file_capability(message);
     LocalPrintContext context;
     {
         std::lock_guard<std::mutex> lock(local_print_context_mutex);
         const auto it = local_print_contexts.find(device_id);
         if (it == local_print_contexts.end() || !it->second.active) {
-            return message;
+            return capability_message;
         }
         context = it->second;
     }
 
-    const size_t print_key_pos = message.find("\"print\"");
+    const size_t print_key_pos = capability_message.find("\"print\"");
     if (print_key_pos == std::string::npos) {
-        return message;
+        return capability_message;
     }
-    const size_t object_start = message.find('{', print_key_pos);
+    const size_t object_start = capability_message.find('{', print_key_pos);
     if (object_start == std::string::npos) {
-        return message;
+        return capability_message;
     }
 
-    const bool has_project_id = message.find("\"project_id\"", print_key_pos) != std::string::npos;
-    const bool has_profile_id = message.find("\"profile_id\"", print_key_pos) != std::string::npos;
-    const bool has_subtask_id = message.find("\"subtask_id\"", print_key_pos) != std::string::npos;
-    const bool has_task_id = message.find("\"task_id\"", print_key_pos) != std::string::npos;
+    const bool has_project_id = capability_message.find("\"project_id\"", print_key_pos) != std::string::npos;
+    const bool has_profile_id = capability_message.find("\"profile_id\"", print_key_pos) != std::string::npos;
+    const bool has_subtask_id = capability_message.find("\"subtask_id\"", print_key_pos) != std::string::npos;
+    const bool has_task_id = capability_message.find("\"task_id\"", print_key_pos) != std::string::npos;
     if (has_project_id && has_profile_id && has_subtask_id && has_task_id) {
-        return message;
+        return capability_message;
     }
 
     std::string injected;
@@ -373,7 +574,7 @@ static std::string rewrite_local_print_status_message(const std::string &device_
         return message;
     }
 
-    std::string rewritten = message;
+    std::string rewritten = capability_message;
     rewritten.insert(object_start + 1, injected);
     return rewritten;
 }
@@ -609,7 +810,7 @@ static void write_backtrace_once(const char *label)
     free(symbols);
 }
 
-static std::string preview_payload(const std::string &message, size_t limit = 1024)
+static std::string preview_payload(const std::string &message, size_t limit)
 {
     const size_t preview_len = std::min(message.size(), limit);
     std::string preview = BambuPlugin::json_escape(message.substr(0, preview_len));
@@ -743,6 +944,233 @@ static int start_local_print_impl(const PrintParams &params, OnUpdateStatusFn up
 void bambu_init() {
     LOG_CALL();
     write_diag("bambu_init");
+}
+
+int Bambu_Create(Bambu_Tunnel *tunnel, char const *path)
+{
+    if (!tunnel || !path) {
+        last_tunnel_error = "Bambu_Create: invalid arguments";
+        return -1;
+    }
+
+    auto session = std::make_unique<CompatTunnel>();
+    session->url = path;
+    session->device_id = bambu_query_param(session->url, "device");
+    if (session->device_id.empty()) {
+        last_tunnel_error = "Bambu_Create: missing device in URL";
+        return -1;
+    }
+
+    *tunnel = reinterpret_cast<Bambu_Tunnel>(session.release());
+    write_diag("Bambu_Create: url=" + std::string(path) + " device=" + as_compat_tunnel(*tunnel)->device_id);
+    return Bambu_success;
+}
+
+void Bambu_SetLogger(Bambu_Tunnel tunnel, Logger logger, void *context)
+{
+    if (auto *session = as_compat_tunnel(tunnel)) {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        session->logger = logger;
+        session->logger_context = context;
+    }
+}
+
+int Bambu_Open(Bambu_Tunnel tunnel)
+{
+    auto *session = as_compat_tunnel(tunnel);
+    if (!session) {
+        last_tunnel_error = "Bambu_Open: invalid tunnel";
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->opened = true;
+    compat_tunnel_log(session, "Bambu_Open: device=" + session->device_id);
+    return Bambu_success;
+}
+
+int Bambu_StartStream(Bambu_Tunnel tunnel, bool video)
+{
+    auto *session = as_compat_tunnel(tunnel);
+    if (!session) {
+        last_tunnel_error = "Bambu_StartStream: invalid tunnel";
+        return -1;
+    }
+    if (video) {
+        last_tunnel_error = "Bambu_StartStream: video stream unsupported";
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->control_stream_started = true;
+    return Bambu_success;
+}
+
+int Bambu_StartStreamEx(Bambu_Tunnel tunnel, int type)
+{
+    auto *session = as_compat_tunnel(tunnel);
+    if (!session) {
+        last_tunnel_error = "Bambu_StartStreamEx: invalid tunnel";
+        return -1;
+    }
+    if (type != 0x3001) {
+        last_tunnel_error = "Bambu_StartStreamEx: unsupported stream type";
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->control_stream_started = true;
+    return Bambu_success;
+}
+
+int Bambu_GetStreamCount(Bambu_Tunnel)
+{
+    return 0;
+}
+
+int Bambu_GetStreamInfo(Bambu_Tunnel, int, Bambu_StreamInfo *)
+{
+    return -1;
+}
+
+unsigned long Bambu_GetDuration(Bambu_Tunnel)
+{
+    return 0;
+}
+
+int Bambu_Seek(Bambu_Tunnel, unsigned long)
+{
+    return -1;
+}
+
+int Bambu_SendMessage(Bambu_Tunnel tunnel, int ctrl, char const *data, int len)
+{
+    auto *session = as_compat_tunnel(tunnel);
+    if (!session || !data || len < 0) {
+        last_tunnel_error = "Bambu_SendMessage: invalid arguments";
+        return -1;
+    }
+    if (ctrl != 0x3001) {
+        last_tunnel_error = "Bambu_SendMessage: unsupported control type";
+        return -1;
+    }
+
+    const std::string request(data, static_cast<size_t>(len));
+    const bool is_file_download = request.find("\"cmdtype\":4") != std::string::npos;
+    compat_tunnel_log(session, "Bambu_SendMessage: device=" + session->device_id + " request=" + preview_payload(request));
+    rust::Vec<std::uint8_t> response = bambu_network_rs_tunnel_request(session->url, session->device_id, request);
+    if (response.empty()) {
+        last_tunnel_error = "Bambu_SendMessage: empty control response";
+        return -1;
+    }
+
+    std::string response_bytes;
+    response_bytes.reserve(response.size());
+    for (std::uint8_t byte : response) {
+        response_bytes.push_back(static_cast<char>(byte));
+    }
+    compat_tunnel_log(session, "Bambu_SendMessage: response_bytes=" + std::to_string(response_bytes.size()));
+
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (is_file_download) {
+            auto frames = split_file_download_response_frames(response_bytes);
+            compat_tunnel_log(
+                session,
+                "Bambu_SendMessage: queued_frames=" + std::to_string(frames.size()) +
+                    " chunked_file_download=" + std::string(frames.size() > 1 ? "true" : "false"));
+            for (auto &frame : frames) {
+                session->queued_responses.emplace_back(std::move(frame));
+            }
+        } else {
+            session->queued_responses.emplace_back(std::move(response_bytes));
+        }
+    }
+    return Bambu_success;
+}
+
+int Bambu_ReadSample(Bambu_Tunnel tunnel, Bambu_Sample *sample)
+{
+    auto *session = as_compat_tunnel(tunnel);
+    if (!session || !sample) {
+        last_tunnel_error = "Bambu_ReadSample: invalid arguments";
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (session->queued_responses.empty()) {
+        return Bambu_would_block;
+    }
+
+    session->active_response = std::move(session->queued_responses.front());
+    session->queued_responses.pop_front();
+    compat_tunnel_log(session, "Bambu_ReadSample: response_bytes=" + std::to_string(session->active_response.size()));
+    sample->itrack = 0;
+    sample->size = static_cast<int>(session->active_response.size());
+    sample->flags = 1;
+    sample->buffer = reinterpret_cast<unsigned char const *>(session->active_response.data());
+    sample->decode_time = 0;
+    return Bambu_success;
+}
+
+int Bambu_RecvMessage(Bambu_Tunnel tunnel, int *ctrl, char *data, int *len)
+{
+    auto *session = as_compat_tunnel(tunnel);
+    if (!session || !len) {
+        last_tunnel_error = "Bambu_RecvMessage: invalid arguments";
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (session->queued_responses.empty()) {
+        return Bambu_would_block;
+    }
+
+    const std::string &response = session->queued_responses.front();
+    if (!data || *len < static_cast<int>(response.size())) {
+        *len = static_cast<int>(response.size());
+        return Bambu_buffer_limit;
+    }
+
+    std::memcpy(data, response.data(), response.size());
+    *len = static_cast<int>(response.size());
+    if (ctrl) {
+        *ctrl = 0x3001;
+    }
+    session->queued_responses.pop_front();
+    return Bambu_success;
+}
+
+void Bambu_Close(Bambu_Tunnel tunnel)
+{
+    if (auto *session = as_compat_tunnel(tunnel)) {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        session->opened = false;
+        session->control_stream_started = false;
+        session->queued_responses.clear();
+        session->active_response.clear();
+    }
+}
+
+void Bambu_Destroy(Bambu_Tunnel tunnel)
+{
+    delete as_compat_tunnel(tunnel);
+}
+
+int Bambu_Init()
+{
+    return Bambu_success;
+}
+
+void Bambu_Deinit()
+{
+}
+
+char const *Bambu_GetLastErrorMsg()
+{
+    return last_tunnel_error.c_str();
+}
+
+void Bambu_FreeLogMsg(tchar const *msg)
+{
+    std::free(const_cast<tchar *>(msg));
 }
 
 void bambu_network_cb_printer_available(const std::string &json) {

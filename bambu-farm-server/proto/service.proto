@@ -48,10 +48,20 @@ message UploadFileResponse {
     bool success = 1;
 }
 
+message ControlMessageRequest {
+    string dev_id = 1;
+    string data = 2;
+}
+
+message ControlMessageResponse {
+    string data = 1;
+}
+
 service BambuFarm {
     rpc GetAvailablePrinters(PrinterOptionRequest) returns (stream PrinterOptionList);
     rpc ConnectPrinter(ConnectRequest) returns (stream RecvMessage);
     rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
     rpc UploadFile(UploadFileRequest) returns (UploadFileResponse);
     rpc UploadFileStream(stream UploadFileChunk) returns (UploadFileResponse);
+    rpc SendControlMessage(ControlMessageRequest) returns (ControlMessageResponse);
 }

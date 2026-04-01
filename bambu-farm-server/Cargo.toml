@@ -19,6 +19,7 @@ tempfile = "3.8.0"
 env_logger = "0.10.0"
 log = "0.4"
 config = { version = "0.13.3", features = ["toml"] }
+serde_json = "1.0"
 
 [build-dependencies]
 tonic-build = "0.10"

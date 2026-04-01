@@ -6,6 +6,7 @@
 
 #include <string>
 #include <map>
+#include <cstddef>
 
 using namespace BBL;
 using namespace Slic3r;
@@ -13,6 +14,37 @@ using namespace Slic3r;
 #define EXPORT extern "C" __attribute__((visibility("default")))
 
 EXPORT __attribute__((constructor)) void bambu_init();
+
+using tchar = char;
+using Bambu_Tunnel = void *;
+using Logger = void (*)(void *context, int level, tchar const *msg);
+
+struct Bambu_StreamInfo
+{
+    int type;
+    int sub_type;
+    int format_type;
+    int format_size;
+    int max_frame_size;
+    unsigned char const *format_buffer;
+};
+
+struct Bambu_Sample
+{
+    int itrack;
+    int size;
+    int flags;
+    unsigned char const *buffer;
+    unsigned long long decode_time;
+};
+
+enum Bambu_Error
+{
+    Bambu_success = 0,
+    Bambu_stream_end = 1,
+    Bambu_would_block = 2,
+    Bambu_buffer_limit = 3,
+};
 
 __attribute__((visibility("default"))) void bambu_network_cb_printer_available(const std::string &device_id);
 __attribute__((visibility("default"))) void bambu_network_cb_message_recv(const std::string &device_id, const std::string &message);
@@ -130,5 +162,24 @@ EXPORT int bambu_network_get_model_mall_rating(...);
 EXPORT int bambu_network_put_rating_picture_oss(...);
 EXPORT int bambu_network_del_rating_picture_oss(...);
 EXPORT int bambu_network_get_setting_list2(void *agent, std::string bundle_version, CheckFn chk_fn, ProgressFn pro_fn, WasCancelledFn cancel_fn);
+
+EXPORT int Bambu_Create(Bambu_Tunnel *tunnel, char const *path);
+EXPORT void Bambu_SetLogger(Bambu_Tunnel tunnel, Logger logger, void *context);
+EXPORT int Bambu_Open(Bambu_Tunnel tunnel);
+EXPORT int Bambu_StartStream(Bambu_Tunnel tunnel, bool video);
+EXPORT int Bambu_StartStreamEx(Bambu_Tunnel tunnel, int type);
+EXPORT int Bambu_GetStreamCount(Bambu_Tunnel tunnel);
+EXPORT int Bambu_GetStreamInfo(Bambu_Tunnel tunnel, int index, Bambu_StreamInfo *info);
+EXPORT unsigned long Bambu_GetDuration(Bambu_Tunnel tunnel);
+EXPORT int Bambu_Seek(Bambu_Tunnel tunnel, unsigned long time);
+EXPORT int Bambu_ReadSample(Bambu_Tunnel tunnel, Bambu_Sample *sample);
+EXPORT int Bambu_SendMessage(Bambu_Tunnel tunnel, int ctrl, char const *data, int len);
+EXPORT int Bambu_RecvMessage(Bambu_Tunnel tunnel, int *ctrl, char *data, int *len);
+EXPORT void Bambu_Close(Bambu_Tunnel tunnel);
+EXPORT void Bambu_Destroy(Bambu_Tunnel tunnel);
+EXPORT int Bambu_Init();
+EXPORT void Bambu_Deinit();
+EXPORT char const *Bambu_GetLastErrorMsg();
+EXPORT void Bambu_FreeLogMsg(tchar const *msg);
 
 #endif // PLUGIN_API_H

@@ -4,19 +4,24 @@ use std::env::current_dir;
 use std::env::var_os;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
+use std::process::{self, Command};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use cxx::let_cxx_string;
 
-use config::{Config, ConfigError};
+use config::{Config, ConfigError, Value as ConfigValue};
 use futures::StreamExt;
 use futures::stream;
 use lazy_static::lazy_static;
 use log::debug;
 use log::warn;
+use serde_json::{json, Value as JsonValue};
+use suppaftp::native_tls::TlsConnector;
+use suppaftp::types::FileType;
+use suppaftp::{NativeTlsConnector, NativeTlsFtpStream};
 use tokio::spawn;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
@@ -28,7 +33,9 @@ use tonic::Request;
 use url::Url;
 use zip::ZipArchive;
 
-use crate::api::bambu_farm::{ConnectRequest, SendMessageRequest, UploadFileChunk};
+use crate::api::bambu_farm::{
+    ConnectRequest, ControlMessageRequest, SendMessageRequest, UploadFileChunk,
+};
 use crate::api::ffi::bambu_network_cb_connected;
 use crate::api::ffi::bambu_network_cb_disconnected;
 use crate::api::ffi::bambu_network_cb_message_recv;
@@ -43,6 +50,35 @@ const UPLOAD_CHUNK_SIZE: usize = 256 * 1024;
 
 pub mod bambu_farm {
     tonic::include_proto!("_");
+}
+
+fn get_config() -> Option<Config> {
+    let config_file_path = config_file_candidates()
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from("bambufarm.toml"));
+
+    Config::builder()
+        .add_source(config::File::with_name(&config_file_path.to_string_lossy()).required(false))
+        .add_source(config::Environment::with_prefix("BAMBU_FARM"))
+        .build()
+        .ok()
+}
+
+fn value_string(table: &config::Map<String, ConfigValue>, key: &str) -> Option<String> {
+    table.get(key).map(|value| value.to_string())
+}
+
+fn printer_host_for_device(device_id: &str) -> Option<String> {
+    let config = get_config()?;
+    let printers = config.get_array("printers").ok()?;
+    for printer in printers {
+        let printer = printer.into_table().ok()?;
+        if value_string(&printer, "dev_id").as_deref() == Some(device_id) {
+            return value_string(&printer, "host");
+        }
+    }
+    None
 }
 
 fn config_file_candidates() -> Vec<PathBuf> {
@@ -99,6 +135,11 @@ mod ffi {
             local_filename: String,
             remote_filename: String,
         ) -> i32;
+        pub fn bambu_network_rs_tunnel_request(
+            tunnel_url: String,
+            device_id: String,
+            data: String,
+        ) -> Vec<u8>;
         pub fn bambu_network_rs_extract_3mf_thumbnail(
             local_filename: String,
             plate_index: i32,
@@ -196,6 +237,203 @@ fn clear_active_connection(device_id: &str, generation: u64) {
             current.take();
         }
     }
+}
+
+fn tunnel_url_host(url: &str) -> Option<String> {
+    let prefix = "bambu:///local/";
+    let suffix = url.strip_prefix(prefix)?;
+    let host_part = suffix.split('?').next().unwrap_or_default();
+    let trimmed = host_part.trim_matches('/');
+    let trimmed = trimmed.trim_end_matches('.');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn tunnel_query_value(url: &str, key: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    let parsed = Url::parse(&format!("http://dummy/?{}", query)).ok()?;
+    parsed
+        .query_pairs()
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, value)| value.into_owned())
+}
+
+fn ftps_connector() -> Result<NativeTlsConnector, String> {
+    let mut builder = TlsConnector::builder();
+    builder.danger_accept_invalid_certs(true);
+    builder.danger_accept_invalid_hostnames(true);
+    let connector = builder
+        .build()
+        .map_err(|err| format!("failed to build TLS connector: {}", err))?;
+    Ok(NativeTlsConnector::from(connector))
+}
+
+fn finalize_ftps_login(
+    mut ftp_stream: NativeTlsFtpStream,
+    username: &str,
+    password: &str,
+) -> Result<NativeTlsFtpStream, String> {
+    ftp_stream
+        .login(username, password)
+        .map_err(|err| format!("failed to login to FTPS server: {}", err))?;
+    ftp_stream
+        .transfer_type(FileType::Binary)
+        .map_err(|err| format!("failed to enable binary transfer mode: {}", err))?;
+    Ok(ftp_stream)
+}
+
+fn connect_ftps(host: &str, username: &str, password: &str) -> Result<NativeTlsFtpStream, String> {
+    match NativeTlsFtpStream::connect_secure_implicit((host, 990), ftps_connector()?, host) {
+        Ok(ftp_stream) => return finalize_ftps_login(ftp_stream, username, password),
+        Err(implicit_err) => {
+            bambu_network_rs_log_debug(format!(
+                "bambu_network_rs_tunnel_request: implicit FTPS connect failed host={} error={}; trying explicit FTPS",
+                host, implicit_err
+            ));
+        }
+    }
+
+    let connector = ftps_connector()?;
+    let ftp_stream = NativeTlsFtpStream::connect((host, 21))
+        .map_err(|err| format!("failed explicit FTP control connect on port 21: {}", err))?;
+    let ftp_stream = ftp_stream
+        .into_secure(connector, host)
+        .map_err(|err| format!("failed to switch explicit FTPS session to TLS: {}", err))?;
+    finalize_ftps_login(ftp_stream, username, password)
+}
+
+fn build_reply_frame(sequence: i64, result: i64, reply: JsonValue, payload: &[u8]) -> Vec<u8> {
+    let header = json!({
+        "result": result,
+        "sequence": sequence,
+        "reply": reply
+    })
+    .to_string();
+    let mut frame = Vec::with_capacity(header.len() + 2 + payload.len());
+    frame.extend_from_slice(header.as_bytes());
+    frame.extend_from_slice(b"\n\n");
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn preview_bytes(bytes: &[u8], limit: usize) -> String {
+    let preview_len = bytes.len().min(limit);
+    String::from_utf8_lossy(&bytes[..preview_len]).into_owned()
+}
+
+fn build_error_frame(sequence: i64, result: i64) -> Vec<u8> {
+    build_reply_frame(sequence, result, json!({}), &[])
+}
+
+fn split_subfile_path(path: &str) -> (&str, Option<&str>) {
+    match path.split_once('#') {
+        Some((root, subpath)) => (root, Some(subpath)),
+        None => (path, None),
+    }
+}
+
+fn guess_mimetype(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "model" => "application/vnd.ms-package.3dmanufacturing-3dmodel+xml",
+        "rels" => "application/vnd.openxmlformats-package.relationships+xml",
+        "config" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+fn extract_zip_entry(zip_bytes: &[u8], subpath: &str) -> Result<Vec<u8>, String> {
+    let reader = Cursor::new(zip_bytes);
+    let mut archive =
+        ZipArchive::new(reader).map_err(|err| format!("failed to open zip payload: {}", err))?;
+    let mut entry = archive
+        .by_name(subpath)
+        .map_err(|err| format!("missing zip entry {}: {}", subpath, err))?;
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes)
+        .map_err(|err| format!("failed to read zip entry {}: {}", subpath, err))?;
+    Ok(bytes)
+}
+
+fn timelapse_thumbnail_path(requested_path: &str) -> Option<String> {
+    let (root, subpath) = split_subfile_path(requested_path);
+    if subpath != Some("thumbnail") || !root.starts_with("timelapse/") {
+        return None;
+    }
+    let filename = root.rsplit('/').next()?;
+    let stem = filename.rsplit_once('.').map(|(base, _)| base).unwrap_or(filename);
+    Some(format!("timelapse/thumbnail/{}.jpg", stem))
+}
+
+fn tunnel_download_file(
+    tunnel_url: &str,
+    device_id: &str,
+    remote_path: &str,
+) -> Result<Vec<u8>, String> {
+    let host = printer_host_for_device(device_id)
+        .or_else(|| tunnel_url_host(tunnel_url))
+        .ok_or_else(|| "missing tunnel host".to_string())?;
+    let username = tunnel_query_value(tunnel_url, "user").unwrap_or_else(|| "bblp".to_string());
+    let password =
+        tunnel_query_value(tunnel_url, "passwd").ok_or_else(|| "missing tunnel password".to_string())?;
+
+    let normalized_path = remote_path.trim_start_matches('/');
+
+    if let Ok(bytes) = tunnel_download_file_via_curl(&host, &username, &password, normalized_path) {
+        return Ok(bytes);
+    }
+
+    let mut ftp_stream = connect_ftps(&host, &username, &password)?;
+    let cursor = ftp_stream
+        .retr_as_buffer(normalized_path)
+        .map_err(|err| format!("failed to download via FTPS: {}", err))?;
+    let _ = ftp_stream.quit();
+    Ok(cursor.into_inner())
+}
+
+fn tunnel_download_file_via_curl(
+    host: &str,
+    username: &str,
+    password: &str,
+    remote_path: &str,
+) -> Result<Vec<u8>, String> {
+    let temp_path = std::env::temp_dir().join(format!(
+        "bambu-tunnel-download-{}-{}.bin",
+        process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let remote_url = format!("ftps://{}/{}", host, remote_path);
+    let status = Command::new("curl")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--fail")
+        .arg("--ssl-reqd")
+        .arg("--insecure")
+        .arg("--user")
+        .arg(format!("{}:{}", username, password))
+        .arg("--output")
+        .arg(&temp_path)
+        .arg(&remote_url)
+        .status()
+        .map_err(|err| format!("failed to launch curl: {}", err))?;
+
+    if !status.success() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("curl FTPS download failed with status {}", status));
+    }
+
+    let bytes = fs::read(&temp_path)
+        .map_err(|err| format!("failed to read curl FTPS temp file: {}", err))?;
+    let _ = fs::remove_file(&temp_path);
+    Ok(bytes)
 }
 
 fn emit_disconnect_event(device_id: &str, status: i32, message: &str) {
@@ -563,6 +801,252 @@ pub fn bambu_network_rs_upload_file(
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(upload)),
         Err(_) => RUNTIME.block_on(upload),
+    }
+}
+
+pub fn bambu_network_rs_tunnel_request(
+    tunnel_url: String,
+    device_id: String,
+    data: String,
+) -> Vec<u8> {
+    let request_body = data.clone();
+    let request = async move {
+        let request_json = request_body
+            .split("\n\n")
+            .next()
+            .unwrap_or(request_body.as_str());
+        let parsed: JsonValue = match serde_json::from_str(request_json) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                bambu_network_rs_log_debug(format!(
+                    "bambu_network_rs_tunnel_request: request parse failed error={}",
+                    err
+                ));
+                return Vec::new();
+            }
+        };
+        let sequence = parsed.get("sequence").and_then(JsonValue::as_i64).unwrap_or(0);
+        let cmdtype = parsed.get("cmdtype").and_then(JsonValue::as_i64).unwrap_or(-1);
+        let req = parsed.get("req").cloned().unwrap_or_else(|| json!({}));
+
+        if cmdtype == 0x0004 {
+            let remote_path = req
+                .get("path")
+                .and_then(JsonValue::as_str)
+                .or_else(|| req.get("file").and_then(JsonValue::as_str))
+                .unwrap_or("");
+            if remote_path.is_empty() {
+                bambu_network_rs_log_debug(
+                    "bambu_network_rs_tunnel_request: FILE_DOWNLOAD missing remote path".to_string(),
+                );
+                return build_error_frame(sequence, 10);
+            }
+
+            match tunnel_download_file(&tunnel_url, &device_id, remote_path) {
+                Ok(blob) => {
+                    let md5_hex = format!("{:x}", md5::compute(&blob));
+                    bambu_network_rs_log_debug(format!(
+                        "bambu_network_rs_tunnel_request: FILE_DOWNLOAD success path={} bytes={} md5={}",
+                        remote_path,
+                        blob.len(),
+                        md5_hex
+                    ));
+                    return build_reply_frame(
+                        sequence,
+                        0,
+                        json!({
+                            "size": blob.len(),
+                            "offset": 0,
+                            "total": blob.len(),
+                            "file_md5": md5_hex,
+                            "ftp_file_md5": md5_hex,
+                            "path": remote_path,
+                        }),
+                        &blob,
+                    );
+                }
+                Err(err) => {
+                    bambu_network_rs_log_debug(format!(
+                        "bambu_network_rs_tunnel_request: FILE_DOWNLOAD failed path={} error={}",
+                        remote_path, err
+                    ));
+                    return build_error_frame(sequence, 10);
+                }
+            }
+        }
+
+        if cmdtype == 0x0002 {
+            let paths: Vec<String> = req
+                .get("paths")
+                .and_then(JsonValue::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(JsonValue::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if paths.is_empty() {
+                bambu_network_rs_log_debug(
+                    "bambu_network_rs_tunnel_request: SUB_FILE missing paths".to_string(),
+                );
+                return build_error_frame(sequence, 10);
+            }
+
+            let first_path = paths[0].clone();
+            let zip_requested = req.get("zip").and_then(JsonValue::as_bool).unwrap_or(false);
+            let (root_path, subpath) = split_subfile_path(&first_path);
+
+            if zip_requested {
+                match tunnel_download_file(&tunnel_url, &device_id, root_path) {
+                    Ok(blob) => {
+                        bambu_network_rs_log_debug(format!(
+                            "bambu_network_rs_tunnel_request: SUB_FILE zip success path={} bytes={}",
+                            root_path,
+                            blob.len()
+                        ));
+                        return build_reply_frame(
+                            sequence,
+                            0,
+                            json!({
+                                "path": root_path,
+                                "size": blob.len(),
+                                "continue": false,
+                            }),
+                            &blob,
+                        );
+                    }
+                    Err(err) => {
+                        bambu_network_rs_log_debug(format!(
+                            "bambu_network_rs_tunnel_request: SUB_FILE zip failed path={} error={}",
+                            root_path, err
+                        ));
+                        return build_error_frame(sequence, 10);
+                    }
+                }
+            }
+
+            if let Some(thumbnail_remote_path) = timelapse_thumbnail_path(&first_path) {
+                match tunnel_download_file(&tunnel_url, &device_id, &thumbnail_remote_path) {
+                    Ok(blob) => {
+                        bambu_network_rs_log_debug(format!(
+                            "bambu_network_rs_tunnel_request: SUB_FILE timelapse thumbnail success path={} remote={} bytes={}",
+                            first_path,
+                            thumbnail_remote_path,
+                            blob.len()
+                        ));
+                        return build_reply_frame(
+                            sequence,
+                            0,
+                            json!({
+                                "path": first_path,
+                                "thumbnail": "thumbnail",
+                                "mimetype": "image/jpeg",
+                                "size": blob.len(),
+                                "continue": false,
+                            }),
+                            &blob,
+                        );
+                    }
+                    Err(err) => {
+                        bambu_network_rs_log_debug(format!(
+                            "bambu_network_rs_tunnel_request: SUB_FILE timelapse thumbnail failed path={} remote={} error={}",
+                            first_path, thumbnail_remote_path, err
+                        ));
+                        return build_error_frame(sequence, 10);
+                    }
+                }
+            }
+
+            if let Some(subpath) = subpath {
+                match tunnel_download_file(&tunnel_url, &device_id, root_path) {
+                    Ok(blob) => match extract_zip_entry(&blob, subpath) {
+                        Ok(entry_bytes) => {
+                            bambu_network_rs_log_debug(format!(
+                                "bambu_network_rs_tunnel_request: SUB_FILE zip entry success path={} bytes={}",
+                                first_path,
+                                entry_bytes.len()
+                            ));
+                            return build_reply_frame(
+                                sequence,
+                                0,
+                                json!({
+                                    "path": first_path,
+                                    "thumbnail": subpath,
+                                    "mimetype": guess_mimetype(subpath),
+                                    "size": entry_bytes.len(),
+                                    "continue": false,
+                                }),
+                                &entry_bytes,
+                            );
+                        }
+                        Err(err) => {
+                            bambu_network_rs_log_debug(format!(
+                                "bambu_network_rs_tunnel_request: SUB_FILE zip entry failed path={} error={}",
+                                first_path, err
+                            ));
+                            return build_error_frame(sequence, 10);
+                        }
+                    },
+                    Err(err) => {
+                        bambu_network_rs_log_debug(format!(
+                            "bambu_network_rs_tunnel_request: SUB_FILE remote download failed path={} error={}",
+                            root_path, err
+                        ));
+                        return build_error_frame(sequence, 10);
+                    }
+                }
+            }
+
+            bambu_network_rs_log_debug(format!(
+                "bambu_network_rs_tunnel_request: SUB_FILE unsupported request path={} zip={}",
+                first_path, zip_requested
+            ));
+            return build_error_frame(sequence, 10);
+        }
+
+        let mut client = match connect_client().await {
+            Ok(client) => client,
+            Err(err) => {
+                bambu_network_rs_log_debug(format!(
+                    "bambu_network_rs_tunnel_request: failed to connect to farm error={}",
+                    err
+                ));
+                return Vec::new();
+            }
+        };
+
+        match client
+            .send_control_message(ControlMessageRequest {
+                dev_id: device_id,
+                data: request_body,
+            })
+            .await
+        {
+            Ok(response) => {
+                let bytes = response.into_inner().data.into_bytes();
+                bambu_network_rs_log_debug(format!(
+                    "bambu_network_rs_tunnel_request: control RPC success cmdtype={} sequence={} bytes={} preview={}",
+                    cmdtype,
+                    sequence,
+                    bytes.len(),
+                    preview_bytes(&bytes, 240)
+                ));
+                bytes
+            }
+            Err(err) => {
+                bambu_network_rs_log_debug(format!(
+                    "bambu_network_rs_tunnel_request: control RPC failed error={}",
+                    err
+                ));
+                Vec::new()
+            }
+        }
+    };
+
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(request)),
+        Err(_) => RUNTIME.block_on(request),
     }
 }
 

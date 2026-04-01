@@ -16,7 +16,7 @@ shared:
 	rm -f ./* || echo "nothing to remove"
 	ar -x ../libbambu_farm_client.a
 	gcc -shared -Wl,-z,noexecstack *.o -o libbambu_networking.so
-	gcc -fPIC -shared ../../../cpp/bambu_source.c -o libBambuSource.so
+	gcc -fPIC -shared ../../../cpp/bambu_source.c -ldl -o libBambuSource.so
 
 install-host: shared
 	mkdir -p "$(BAMBU_STUDIO_PLUGIN_DIR)"
