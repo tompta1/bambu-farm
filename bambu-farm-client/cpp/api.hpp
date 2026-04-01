@@ -118,7 +118,7 @@ EXPORT int bambu_network_set_server_callback(void *agent, OnServerErrFn fn);
 EXPORT int bambu_network_ping_bind(void *agent, std::string ping_code);
 EXPORT int bambu_network_bind_detect(void *agent, std::string dev_ip, std::string sec_link, detectResult &detect);
 EXPORT int bambu_network_check_user_report(...);
-EXPORT int bambu_network_get_subtask_info(...);
+EXPORT int bambu_network_get_subtask_info(void *agent, std::string subtask_id, std::string *task_json, unsigned int *http_code, std::string *http_body);
 EXPORT int bambu_network_get_camera_url_for_golive(...);
 EXPORT int bambu_network_get_mw_user_preference(void *agent, std::function<void(std::string)> callback);
 EXPORT int bambu_network_get_mw_user_4ulist(void *agent, int seed, int limit, std::function<void(std::string)> callback);

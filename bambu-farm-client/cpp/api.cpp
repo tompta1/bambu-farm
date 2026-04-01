@@ -3,6 +3,7 @@
 #include "stdio.h"
 
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -50,6 +51,24 @@ static std::atomic<bool> connect_in_progress{false};
 static std::mutex printer_name_overrides_mutex;
 static std::unordered_map<std::string, std::string> printer_name_overrides;
 static std::unordered_map<std::string, std::string> last_printer_json_by_id;
+static std::mutex local_print_context_mutex;
+static void persist_local_print_contexts();
+
+struct LocalPrintContext
+{
+    std::string dev_id;
+    std::string project_id;
+    std::string profile_id;
+    std::string subtask_id;
+    std::string task_id;
+    std::string remote_filename;
+    std::string plate_path;
+    std::string thumbnail_url;
+    int plate_index{-1};
+    bool active{false};
+};
+
+static std::unordered_map<std::string, LocalPrintContext> local_print_contexts;
 
 static void write_diag(const std::string &message);
 
@@ -87,6 +106,47 @@ static std::string printer_names_state_path()
     return "/tmp/bambu-oss-printer-names.tsv";
 }
 
+static std::string local_thumbnail_cache_dir()
+{
+    if (!config_dir_path.empty()) {
+        return config_dir_path + "/oss-thumbnails";
+    }
+
+    const char *xdg = std::getenv("XDG_CONFIG_HOME");
+    const char *home = std::getenv("HOME");
+    if (xdg && *xdg) {
+        return std::string(xdg) + "/BambuStudio/oss-thumbnails";
+    }
+    if (home && *home) {
+        return std::string(home) + "/.config/BambuStudio/oss-thumbnails";
+    }
+    return "/tmp/bambu-oss-thumbnails";
+}
+
+static std::string local_print_contexts_state_path()
+{
+    if (!config_dir_path.empty()) {
+        return config_dir_path + "/oss-local-print-contexts.tsv";
+    }
+
+    const char *xdg = std::getenv("XDG_CONFIG_HOME");
+    const char *home = std::getenv("HOME");
+    if (xdg && *xdg) {
+        return std::string(xdg) + "/BambuStudio/oss-local-print-contexts.tsv";
+    }
+    if (home && *home) {
+        return std::string(home) + "/.config/BambuStudio/oss-local-print-contexts.tsv";
+    }
+    return "/tmp/bambu-oss-local-print-contexts.tsv";
+}
+
+static std::string synthetic_local_id(const char *prefix, const std::string &dev_id, const std::string &remote_filename)
+{
+    std::hash<std::string> hasher;
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    return std::string(prefix) + "-" + std::to_string(hasher(dev_id + "|" + remote_filename + "|" + std::to_string(now)));
+}
+
 static bool find_json_string_value_range(const std::string &json, const std::string &key, size_t &value_start, size_t &value_end)
 {
     const std::string needle = "\"" + key + "\": \"";
@@ -121,6 +181,201 @@ static std::string json_string_field(const std::string &json, const std::string 
         return "";
     }
     return json.substr(value_start, value_end - value_start);
+}
+
+static void clear_local_print_context(const std::string &dev_id)
+{
+    if (dev_id.empty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(local_print_context_mutex);
+        local_print_contexts.erase(dev_id);
+    }
+    persist_local_print_contexts();
+}
+
+static void persist_local_print_contexts()
+{
+    const std::string path = local_print_contexts_state_path();
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out.is_open()) {
+        write_diag("persist_local_print_contexts: failed path=" + path);
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(local_print_context_mutex);
+    for (const auto &[dev_id, context] : local_print_contexts) {
+        if (!context.active || dev_id.empty()) {
+            continue;
+        }
+        out
+            << context.dev_id << '\t'
+            << context.project_id << '\t'
+            << context.profile_id << '\t'
+            << context.subtask_id << '\t'
+            << context.task_id << '\t'
+            << context.remote_filename << '\t'
+            << context.plate_path << '\t'
+            << context.thumbnail_url << '\t'
+            << context.plate_index << '\n';
+    }
+    write_diag("persist_local_print_contexts: wrote path=" + path);
+}
+
+static void load_local_print_contexts()
+{
+    const std::string path = local_print_contexts_state_path();
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        write_diag("load_local_print_contexts: no state path=" + path);
+        return;
+    }
+
+    std::unordered_map<std::string, LocalPrintContext> loaded;
+    std::string line;
+    while (std::getline(in, line)) {
+        std::vector<std::string> fields;
+        size_t start = 0;
+        while (true) {
+            const size_t tab = line.find('\t', start);
+            if (tab == std::string::npos) {
+                fields.push_back(line.substr(start));
+                break;
+            }
+            fields.push_back(line.substr(start, tab - start));
+            start = tab + 1;
+        }
+        if (fields.size() != 9 || fields[0].empty()) {
+            continue;
+        }
+
+        LocalPrintContext context;
+        context.dev_id = fields[0];
+        context.project_id = fields[1];
+        context.profile_id = fields[2];
+        context.subtask_id = fields[3];
+        context.task_id = fields[4];
+        context.remote_filename = fields[5];
+        context.plate_path = fields[6];
+        context.thumbnail_url = fields[7];
+        try {
+            context.plate_index = std::stoi(fields[8]);
+        } catch (...) {
+            context.plate_index = 0;
+        }
+        context.active = true;
+        loaded[context.dev_id] = context;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(local_print_context_mutex);
+        local_print_contexts = std::move(loaded);
+    }
+    write_diag("load_local_print_contexts: loaded path=" + path);
+}
+
+static void update_local_print_context(
+    const BBL::PrintParams &params,
+    const std::string &remote_filename,
+    const std::string &plate_path)
+{
+    LocalPrintContext context;
+    context.dev_id = params.dev_id;
+    context.project_id = synthetic_local_id("local-project", params.dev_id, remote_filename);
+    context.profile_id = synthetic_local_id("local-profile", params.dev_id, remote_filename);
+    context.subtask_id = synthetic_local_id("local-subtask", params.dev_id, remote_filename);
+    context.task_id = context.subtask_id;
+    context.remote_filename = remote_filename;
+    context.plate_path = plate_path;
+    context.plate_index = params.plate_index > 0 ? params.plate_index - 1 : 0;
+    rust::String thumbnail_url = bambu_network_rs_extract_3mf_thumbnail(
+        params.filename,
+        params.plate_index,
+        local_thumbnail_cache_dir());
+    context.thumbnail_url = std::string(thumbnail_url.c_str(), thumbnail_url.size());
+    context.active = true;
+
+    {
+        std::lock_guard<std::mutex> lock(local_print_context_mutex);
+        local_print_contexts[params.dev_id] = context;
+    }
+    persist_local_print_contexts();
+
+    write_diag(
+        "update_local_print_context: dev_id=" + context.dev_id +
+        " project_id=" + context.project_id +
+        " profile_id=" + context.profile_id +
+        " subtask_id=" + context.subtask_id +
+        " plate_index=" + std::to_string(context.plate_index) +
+        " thumbnail_url=" + context.thumbnail_url
+    );
+}
+
+static bool lookup_local_print_context_by_subtask_id(const std::string &subtask_id, LocalPrintContext &out)
+{
+    std::lock_guard<std::mutex> lock(local_print_context_mutex);
+    for (const auto &[dev_id, context] : local_print_contexts) {
+        if (context.active && context.subtask_id == subtask_id) {
+            out = context;
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::string rewrite_local_print_status_message(const std::string &device_id, const std::string &message)
+{
+    LocalPrintContext context;
+    {
+        std::lock_guard<std::mutex> lock(local_print_context_mutex);
+        const auto it = local_print_contexts.find(device_id);
+        if (it == local_print_contexts.end() || !it->second.active) {
+            return message;
+        }
+        context = it->second;
+    }
+
+    const size_t print_key_pos = message.find("\"print\"");
+    if (print_key_pos == std::string::npos) {
+        return message;
+    }
+    const size_t object_start = message.find('{', print_key_pos);
+    if (object_start == std::string::npos) {
+        return message;
+    }
+
+    const bool has_project_id = message.find("\"project_id\"", print_key_pos) != std::string::npos;
+    const bool has_profile_id = message.find("\"profile_id\"", print_key_pos) != std::string::npos;
+    const bool has_subtask_id = message.find("\"subtask_id\"", print_key_pos) != std::string::npos;
+    const bool has_task_id = message.find("\"task_id\"", print_key_pos) != std::string::npos;
+    if (has_project_id && has_profile_id && has_subtask_id && has_task_id) {
+        return message;
+    }
+
+    std::string injected;
+    if (!has_project_id) {
+        injected += "\"project_id\":\"" + BambuPlugin::json_escape(context.project_id) + "\",";
+    }
+    if (!has_profile_id) {
+        injected += "\"profile_id\":\"" + BambuPlugin::json_escape(context.profile_id) + "\",";
+    }
+    if (!has_subtask_id) {
+        injected += "\"subtask_id\":\"" + BambuPlugin::json_escape(context.subtask_id) + "\",";
+    }
+    if (!has_task_id) {
+        injected += "\"task_id\":\"" + BambuPlugin::json_escape(context.task_id) + "\",";
+    }
+    if (injected.empty()) {
+        return message;
+    }
+
+    std::string rewritten = message;
+    rewritten.insert(object_start + 1, injected);
+    return rewritten;
 }
 
 static std::string apply_printer_name_override(const std::string &json)
@@ -451,6 +706,8 @@ static int start_local_print_impl(const PrintParams &params, OnUpdateStatusFn up
         return BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED;
     }
 
+    update_local_print_context(params, remote_filename, plate_path);
+
     if (cancel_fn && cancel_fn()) {
         report_update_status(update_fn, PrintingStageERROR, BAMBU_NETWORK_ERR_CANCELED, "Canceled");
         return BAMBU_NETWORK_ERR_CANCELED;
@@ -501,23 +758,24 @@ void bambu_network_cb_printer_available(const std::string &json) {
     connect_selected_device_if_pending(effective_json);
 }
 void bambu_network_cb_message_recv(const std::string &device_id, const std::string &message) {
+    const std::string effective_message = rewrite_local_print_status_message(device_id, message);
     if (on_message || on_mqtt_message) {
         write_diag(
             "bambu_network_cb_message_recv: dev_id=" + device_id +
-            " msg_len=" + std::to_string(message.size()) +
-            " preview=\"" + preview_payload(message) + "\""
+            " msg_len=" + std::to_string(effective_message.size()) +
+            " preview=\"" + preview_payload(effective_message) + "\""
         );
     }
 
     if (on_mqtt_message) {
         write_diag("bambu_network_cb_message_recv: entering local callback");
-        on_mqtt_message(device_id, message);
+        on_mqtt_message(device_id, effective_message);
         write_diag("bambu_network_cb_message_recv: local callback returned");
     }
 
     if (on_message) {
         write_diag("bambu_network_cb_message_recv: entering message callback");
-        on_message(device_id, message);
+        on_message(device_id, effective_message);
         write_diag("bambu_network_cb_message_recv: message callback returned");
     }
 }
@@ -601,6 +859,7 @@ int bambu_network_set_config_dir(void *agent_ptr, std::string config_dir)
     config_dir_path = config_dir;
     load_selected_device();
     load_printer_name_overrides();
+    load_local_print_contexts();
     return 0;
 }
 int bambu_network_set_cert_file(void *agent_ptr, std::string folder, std::string filename)
@@ -792,6 +1051,7 @@ int bambu_network_user_logout(void *agent_ptr, bool request)
     write_diag(std::string("bambu_network_user_logout request=") + (request ? "true" : "false"));
     if (!selected_device.empty()) {
         bambu_network_rs_disconnect(selected_device);
+        clear_local_print_context(selected_device);
     }
     printer_connected.store(false);
     selected_device.clear();
@@ -1166,7 +1426,6 @@ BAMBU_COMPAT_STUB(bambu_network_get_oss_config)
 BAMBU_COMPAT_STUB(bambu_network_get_my_token)
 BAMBU_COMPAT_STUB(bambu_network_track_remove_files)
 BAMBU_COMPAT_STUB(bambu_network_check_user_report)
-BAMBU_COMPAT_STUB(bambu_network_get_subtask_info)
 BAMBU_COMPAT_STUB(bambu_network_get_camera_url_for_golive)
 BAMBU_COMPAT_STUB(bambu_network_get_hms_snapshot)
 BAMBU_COMPAT_STUB(bambu_network_get_model_rating_id)
@@ -1175,6 +1434,52 @@ BAMBU_COMPAT_STUB(bambu_network_get_model_instance_id)
 BAMBU_COMPAT_STUB(bambu_network_get_model_mall_rating)
 BAMBU_COMPAT_STUB(bambu_network_put_rating_picture_oss)
 BAMBU_COMPAT_STUB(bambu_network_del_rating_picture_oss)
+
+int bambu_network_get_subtask_info(void *agent_ptr, std::string subtask_id, std::string *task_json, unsigned int *http_code, std::string *http_body)
+{
+    LOG_CALL();
+    LocalPrintContext context;
+    if (!lookup_local_print_context_by_subtask_id(subtask_id, context)) {
+        write_diag("bambu_network_get_subtask_info: not found subtask_id=" + subtask_id);
+        if (http_code) {
+            *http_code = 404;
+        }
+        if (http_body) {
+            *http_body = "{\"error\":\"not_found\"}";
+        }
+        if (task_json) {
+            task_json->clear();
+        }
+        return -1;
+    }
+
+    if (http_code) {
+        *http_code = 200;
+    }
+    if (http_body) {
+        *http_body = "{}";
+    }
+    if (task_json) {
+        *task_json =
+            "{"
+            "\"content\":\"{\\\"info\\\":{\\\"plate_idx\\\":" + std::to_string(context.plate_index) + "}}\","
+            "\"context\":{"
+            "\"plates\":[{"
+            "\"index\":" + std::to_string(context.plate_index) + ","
+            "\"thumbnail\":{\"url\":\"" + BambuPlugin::json_escape(context.thumbnail_url) + "\"},"
+            "\"filaments\":[]"
+            "}]"
+            "}"
+            "}";
+    }
+
+    write_diag(
+        "bambu_network_get_subtask_info: subtask_id=" + subtask_id +
+        " plate_index=" + std::to_string(context.plate_index) +
+        " thumbnail_url=" + context.thumbnail_url
+    );
+    return 0;
+}
 
 int bambu_network_get_user_tasks(void *agent_ptr, TaskQueryParams params, std::string *http_body)
 {

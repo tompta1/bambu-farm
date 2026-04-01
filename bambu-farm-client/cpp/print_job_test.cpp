@@ -107,6 +107,7 @@ static void test_build_project_file_command()
 {
     PrintParams params;
     params.plate_index = 1;
+    params.project_name = "Swift Falcon";
     params.task_record_timelapse = false;
     params.task_bed_leveling = true;
     params.task_flow_cali = true;
@@ -124,13 +125,37 @@ static void test_build_project_file_command()
 
     assert(json.find("\"command\":\"project_file\"") != std::string::npos);
     assert(json.find("\"param\":\"Metadata/plate_1.gcode\"") != std::string::npos);
-    assert(json.find("\"subtask_name\":\"Swift_Falcon.gcode.3mf\"") != std::string::npos);
+    assert(json.find("\"subtask_name\":\"Swift Falcon\"") != std::string::npos);
     assert(json.find("\"url\":\"ftp://Swift_Falcon.gcode.3mf\"") != std::string::npos);
     assert(json.find("\"plate_idx\":0") != std::string::npos);
     assert(json.find("\"bed_leveling\":true") != std::string::npos);
     assert(json.find("\"use_ams\":true") != std::string::npos);
     assert(json.find("\"ams_mapping\":[0,-1]") != std::string::npos);
     assert(json.find("\"ams_mapping_info\":{\"source\":\"ui\"}") != std::string::npos);
+}
+
+static void test_resolve_display_subtask_name_prefers_project_name()
+{
+    PrintParams params;
+    params.project_name = "SFERA Organic Geometric Planters & Pots";
+
+    const std::string display = BambuPlugin::resolve_display_subtask_name(
+        params,
+        "SFERA_Organic_Geometric_Planters_&_Pots-deadbeef.gcode.3mf");
+
+    assert(display == "SFERA Organic Geometric Planters & Pots");
+}
+
+static void test_resolve_display_subtask_name_strips_filename_suffix()
+{
+    PrintParams params;
+    params.filename = "/tmp/session/example.3mf";
+
+    const std::string display = BambuPlugin::resolve_display_subtask_name(
+        params,
+        "example-deadbeef.gcode.3mf");
+
+    assert(display == "example");
 }
 
 static void test_build_logged_in_login_cmd()
@@ -180,6 +205,8 @@ int main()
     test_resolve_remote_filename_differs_for_different_package_contents_same_path();
     test_resolve_plate_metadata_path_is_one_based();
     test_resolve_plate_metadata_path_prefers_explicit_paths();
+    test_resolve_display_subtask_name_prefers_project_name();
+    test_resolve_display_subtask_name_strips_filename_suffix();
     test_build_project_file_command();
     test_build_logged_in_login_cmd();
     test_build_logout_cmd();

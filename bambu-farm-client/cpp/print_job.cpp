@@ -82,6 +82,23 @@ namespace
         return base_name + "-" + suffix;
     }
 
+    std::string strip_known_package_suffixes(std::string value)
+    {
+        if (ends_with_case_insensitive(value, ".gcode.3mf")) {
+            value.resize(value.size() - std::string(".gcode.3mf").size());
+            return value;
+        }
+        if (ends_with_case_insensitive(value, ".3mf")) {
+            value.resize(value.size() - std::string(".3mf").size());
+            return value;
+        }
+        if (ends_with_case_insensitive(value, ".gcode")) {
+            value.resize(value.size() - std::string(".gcode").size());
+            return value;
+        }
+        return value;
+    }
+
     std::string short_path_suffix(const std::string &path)
     {
         if (path.empty()) {
@@ -211,6 +228,26 @@ namespace BambuPlugin
         return value + ".gcode.3mf";
     }
 
+    std::string resolve_display_subtask_name(const BBL::PrintParams &params, const std::string &remote_filename)
+    {
+        if (!trim_ascii(params.project_name).empty()) {
+            return params.project_name;
+        }
+        if (!trim_ascii(params.task_name).empty()) {
+            return params.task_name;
+        }
+        if (!trim_ascii(params.dst_file).empty()) {
+            return strip_known_package_suffixes(basename_or_empty(params.dst_file));
+        }
+        if (!trim_ascii(params.ftp_file).empty()) {
+            return strip_known_package_suffixes(basename_or_empty(params.ftp_file));
+        }
+        if (!trim_ascii(params.filename).empty()) {
+            return strip_known_package_suffixes(basename_or_empty(params.filename));
+        }
+        return strip_known_package_suffixes(remote_filename);
+    }
+
     std::string resolve_remote_filename(const BBL::PrintParams &params)
     {
         const std::string source_name = basename_or_empty(params.filename);
@@ -269,9 +306,10 @@ namespace BambuPlugin
         const std::string &plate_path
     )
     {
+        const std::string display_name = resolve_display_subtask_name(params, remote_filename);
         std::string json =
             "{\"print\":{\"sequence_id\":0,\"command\":\"project_file\",\"param\":\"" + json_escape(plate_path) +
-            "\",\"subtask_name\":\"" + json_escape(remote_filename) +
+            "\",\"subtask_name\":\"" + json_escape(display_name) +
             "\",\"url\":\"ftp://" + json_escape(remote_filename) +
             "\",\"plate_idx\":" + std::to_string(params.plate_index > 0 ? params.plate_index - 1 : 0) +
             ",\"timelapse\":" + (params.task_record_timelapse ? "true" : "false") +

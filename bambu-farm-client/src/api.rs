@@ -1,6 +1,10 @@
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::env::current_dir;
 use std::env::var_os;
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -21,6 +25,8 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 use tokio::time::sleep;
 use tonic::Request;
+use url::Url;
+use zip::ZipArchive;
 
 use crate::api::bambu_farm::{ConnectRequest, SendMessageRequest, UploadFileChunk};
 use crate::api::ffi::bambu_network_cb_connected;
@@ -93,6 +99,11 @@ mod ffi {
             local_filename: String,
             remote_filename: String,
         ) -> i32;
+        pub fn bambu_network_rs_extract_3mf_thumbnail(
+            local_filename: String,
+            plate_index: i32,
+            output_dir: String,
+        ) -> String;
     }
 
     unsafe extern "C++" {
@@ -553,4 +564,106 @@ pub fn bambu_network_rs_upload_file(
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(upload)),
         Err(_) => RUNTIME.block_on(upload),
     }
+}
+
+pub fn bambu_network_rs_extract_3mf_thumbnail(
+    local_filename: String,
+    plate_index: i32,
+    output_dir: String,
+) -> String {
+    let plate_number = if plate_index > 0 { plate_index as usize } else { 1usize };
+    let candidates = [
+        format!("Metadata/plate_{}.png", plate_number),
+        format!("Metadata/plate_{}_small.png", plate_number),
+        "Auxiliaries/.thumbnails/thumbnail_3mf.png".to_string(),
+        "/Auxiliaries/.thumbnails/thumbnail_3mf.png".to_string(),
+        "Metadata/plate_1.png".to_string(),
+        "Metadata/plate_1_small.png".to_string(),
+    ];
+
+    let file = match fs::File::open(&local_filename) {
+        Ok(file) => file,
+        Err(err) => {
+            bambu_network_rs_log_debug(format!(
+                "bambu_network_rs_extract_3mf_thumbnail: open failed path={} error={}",
+                local_filename, err
+            ));
+            return String::new();
+        }
+    };
+    let mut archive = match ZipArchive::new(file) {
+        Ok(archive) => archive,
+        Err(err) => {
+            bambu_network_rs_log_debug(format!(
+                "bambu_network_rs_extract_3mf_thumbnail: zip open failed path={} error={}",
+                local_filename, err
+            ));
+            return String::new();
+        }
+    };
+
+    let mut png_bytes = Vec::new();
+    let mut matched_name = String::new();
+    for candidate in candidates {
+        match archive.by_name(&candidate) {
+            Ok(mut entry) => {
+                if entry.read_to_end(&mut png_bytes).is_ok() && !png_bytes.is_empty() {
+                    matched_name = candidate;
+                    break;
+                }
+                png_bytes.clear();
+            }
+            Err(_) => {}
+        }
+    }
+
+    if png_bytes.is_empty() {
+        bambu_network_rs_log_debug(format!(
+            "bambu_network_rs_extract_3mf_thumbnail: no thumbnail found path={} plate_index={}",
+            local_filename, plate_index
+        ));
+        return String::new();
+    }
+
+    if let Err(err) = fs::create_dir_all(&output_dir) {
+        bambu_network_rs_log_debug(format!(
+            "bambu_network_rs_extract_3mf_thumbnail: mkdir failed path={} error={}",
+            output_dir, err
+        ));
+        return String::new();
+    }
+
+    let mut hasher = DefaultHasher::new();
+    local_filename.hash(&mut hasher);
+    plate_index.hash(&mut hasher);
+    png_bytes.hash(&mut hasher);
+    let output_path = PathBuf::from(&output_dir).join(format!("{:016x}.png", hasher.finish()));
+
+    if let Err(err) = fs::write(&output_path, &png_bytes) {
+        bambu_network_rs_log_debug(format!(
+            "bambu_network_rs_extract_3mf_thumbnail: write failed path={} error={}",
+            output_path.display(),
+            err
+        ));
+        return String::new();
+    }
+
+    let url = match Url::from_file_path(&output_path) {
+        Ok(url) => url.to_string(),
+        Err(_) => {
+            bambu_network_rs_log_debug(format!(
+                "bambu_network_rs_extract_3mf_thumbnail: url encode failed path={}",
+                output_path.display()
+            ));
+            return String::new();
+        }
+    };
+
+    bambu_network_rs_log_debug(format!(
+        "bambu_network_rs_extract_3mf_thumbnail: extracted source={} output={} url={}",
+        matched_name,
+        output_path.display(),
+        url
+    ));
+    url
 }

@@ -20,6 +20,7 @@ namespace BambuPlugin
     std::string basename_or_empty(const std::string &path);
     std::string sanitize_remote_filename(std::string value);
     std::string normalize_print_package_name(std::string value);
+    std::string resolve_display_subtask_name(const BBL::PrintParams &params, const std::string &remote_filename);
     std::string resolve_remote_filename(const BBL::PrintParams &params);
     std::string resolve_plate_metadata_path(const BBL::PrintParams &params);
     std::string build_project_file_command(
