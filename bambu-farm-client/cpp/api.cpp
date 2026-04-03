@@ -2,6 +2,7 @@
 #include "cloud_compat.hpp"
 #include "local_state.hpp"
 #include "print_job.hpp"
+#include "session_state.hpp"
 #include "stdio.h"
 
 #include <atomic>
@@ -44,16 +45,12 @@ static OnServerConnectedFn on_server_connected;
 static OnServerErrFn on_server_error;
 static OnUserLoginFn on_user_login;
 static GetSubscribeFailureFn on_subscribe_failure;
-static std::string selected_device;
 static std::string config_dir_path;
 static std::string ca_path;
 static size_t user_login_log_counter = 0;
 static size_t build_login_cmd_log_counter = 0;
 static const char *kLanBackendUrl = "http://127.0.0.1:47403";
 static std::atomic<bool> lan_user_logged_in{true};
-static std::atomic<bool> auto_connect_pending{false};
-static std::atomic<bool> printer_connected{false};
-static std::atomic<bool> connect_in_progress{false};
 static std::mutex printer_name_overrides_mutex;
 static std::unordered_map<std::string, std::string> printer_name_overrides;
 static std::unordered_map<std::string, std::string> last_printer_json_by_id;
@@ -63,6 +60,7 @@ static std::string last_tunnel_error;
 static std::string preview_payload(const std::string &message, size_t limit = 1024);
 static constexpr size_t kTunnelDownloadChunkSize = 4 * 1024 * 1024;
 static std::atomic<std::uint64_t> next_video_stream_id{1};
+static BambuPlugin::SessionState session_state;
 
 struct CompatTunnel
 {
@@ -484,7 +482,7 @@ static void load_printer_name_overrides()
 
 static void persist_selected_device()
 {
-    BambuPlugin::persist_selected_device(config_dir_path, selected_device, write_diag);
+    BambuPlugin::persist_selected_device(config_dir_path, session_state.selected_device(), write_diag);
 }
 
 static void load_selected_device()
@@ -494,12 +492,12 @@ static void load_selected_device()
         return;
     }
 
-    selected_device = loaded;
-    auto_connect_pending.store(true);
+    session_state.load_selected_device(loaded);
 }
 
 static bool printer_json_matches_selected_device(const std::string &json)
 {
+    const std::string selected_device = session_state.selected_device();
     if (selected_device.empty()) {
         return false;
     }
@@ -509,19 +507,19 @@ static bool printer_json_matches_selected_device(const std::string &json)
 
 static void connect_selected_device_if_pending(const std::string &json)
 {
-    if (!auto_connect_pending.load()) {
-        return;
-    }
     if (!printer_json_matches_selected_device(json)) {
         return;
     }
 
-    auto_connect_pending.store(false);
-    write_diag("connect_selected_device_if_pending: autoconnect dev_id=" + selected_device);
-    if (on_printer_connected) {
-        on_printer_connected(selected_device);
+    const std::string target = session_state.claim_autoconnect_target(json_string_field(json, "dev_id"));
+    if (target.empty()) {
+        return;
     }
-    bambu_network_rs_connect(selected_device);
+    write_diag("connect_selected_device_if_pending: autoconnect dev_id=" + target);
+    if (on_printer_connected) {
+        on_printer_connected(target);
+    }
+    bambu_network_rs_connect(target);
 }
 
 static BambuPlugin::LoginState lan_login_state()
@@ -1101,8 +1099,7 @@ void bambu_network_cb_message_recv(const std::string &device_id, const std::stri
 }
 void bambu_network_cb_connected(const std::string &device_id) {
     write_diag("bambu_network_cb_connected: " + device_id);
-    connect_in_progress.store(false);
-    printer_connected.store(true);
+    session_state.mark_connected(device_id);
     if (on_printer_connected) {
         write_diag("bambu_network_cb_connected: signaling printer connected " + device_id);
         on_printer_connected(device_id);
@@ -1120,9 +1117,7 @@ void bambu_network_cb_disconnected(const std::string &device_id, int status, con
         " status=" + std::to_string(status) +
         " message=" + message
     );
-    connect_in_progress.store(false);
-    const bool was_connected = printer_connected.exchange(false);
-    if (on_local_connect && (was_connected || status == ConnectStatusFailed)) {
+    if (on_local_connect && session_state.mark_disconnected(status == ConnectStatusFailed)) {
         write_diag("bambu_network_cb_disconnected: calling on_local_connect");
         on_local_connect(status, device_id, message);
         write_diag("bambu_network_cb_disconnected: on_local_connect returned");
@@ -1229,9 +1224,10 @@ int bambu_network_set_on_printer_connected_fn(void *agent_ptr, OnPrinterConnecte
 {
     LOG_CALL();
     on_printer_connected = fn;
-    if (on_printer_connected && !selected_device.empty() && printer_connected.load()) {
-        write_diag("bambu_network_set_on_printer_connected_fn: signaling existing printer " + selected_device);
-        on_printer_connected(selected_device);
+    const std::string connected_device = session_state.connected_selected_device();
+    if (on_printer_connected && !connected_device.empty()) {
+        write_diag("bambu_network_set_on_printer_connected_fn: signaling existing printer " + connected_device);
+        on_printer_connected(connected_device);
     }
     return 0;
 }
@@ -1267,9 +1263,10 @@ int bambu_network_set_on_local_connect_fn(void *agent_ptr, OnLocalConnectedFn fn
 {
     LOG_CALL();
     on_local_connect = fn;
-    if (on_local_connect && !selected_device.empty() && printer_connected.load()) {
-        write_diag("bambu_network_set_on_local_connect_fn: signaling existing printer " + selected_device);
-        on_local_connect(ConnectStatusOk, selected_device, "Connected");
+    const std::string connected_device = session_state.connected_selected_device();
+    if (on_local_connect && !connected_device.empty()) {
+        write_diag("bambu_network_set_on_local_connect_fn: signaling existing printer " + connected_device);
+        on_local_connect(ConnectStatusOk, connected_device, "Connected");
     }
     return 0;
 }
@@ -1320,19 +1317,17 @@ int bambu_network_send_message(void *agent_ptr, std::string dev_id, std::string 
 int bambu_network_connect_printer(void *agent_ptr, std::string dev_id, std::string dev_ip, std::string username, std::string password, bool use_ssl)
 {
     LOG_CALL_ARGS("%s %s %s %s", dev_id.c_str(), dev_ip.c_str(), username.c_str(), password.c_str());
-    if (selected_device == dev_id && printer_connected.load()) {
+    switch (session_state.begin_connect(dev_id)) {
+    case BambuPlugin::ConnectBeginResult::AlreadyConnected:
         write_diag("bambu_network_connect_printer: already connected " + dev_id);
         return 0;
-    }
-    if (selected_device == dev_id && connect_in_progress.load()) {
+    case BambuPlugin::ConnectBeginResult::AlreadyInProgress:
         write_diag("bambu_network_connect_printer: connect already in progress " + dev_id);
         return 0;
+    case BambuPlugin::ConnectBeginResult::Start:
+        break;
     }
     write_diag("bambu_network_connect_printer: " + dev_id + "@" + dev_ip);
-    selected_device = dev_id;
-    auto_connect_pending.store(false);
-    connect_in_progress.store(true);
-    printer_connected.store(false);
     persist_selected_device();
     bambu_network_rs_connect(dev_id);
     return 0;
@@ -1340,13 +1335,14 @@ int bambu_network_connect_printer(void *agent_ptr, std::string dev_id, std::stri
 int bambu_network_disconnect_printer(void *agent_ptr)
 {
     LOG_CALL();
-    if (connect_in_progress.load() && !printer_connected.load()) {
+    if (session_state.should_ignore_disconnect()) {
         write_diag("bambu_network_disconnect_printer: ignoring disconnect during in-flight connect");
         return 0;
     }
-    if (!selected_device.empty()) {
-        write_diag("bambu_network_disconnect_printer: dev_id=" + selected_device);
-        bambu_network_rs_disconnect(selected_device);
+    const std::string target = session_state.disconnect_target();
+    if (!target.empty()) {
+        write_diag("bambu_network_disconnect_printer: dev_id=" + target);
+        bambu_network_rs_disconnect(target);
     }
     return 0;
 }
@@ -1383,13 +1379,12 @@ bool bambu_network_is_user_login(void *agent_ptr)
 int bambu_network_user_logout(void *agent_ptr, bool request)
 {
     write_diag(std::string("bambu_network_user_logout request=") + (request ? "true" : "false"));
-    if (!selected_device.empty()) {
-        bambu_network_rs_disconnect(selected_device);
-        clear_local_print_context(selected_device);
+    const std::string target = session_state.disconnect_target();
+    if (!target.empty()) {
+        bambu_network_rs_disconnect(target);
+        clear_local_print_context(target);
     }
-    printer_connected.store(false);
-    selected_device.clear();
-    auto_connect_pending.store(false);
+    session_state.clear_after_logout();
     persist_selected_device();
     set_lan_login_state(false, true);
     return 0;
@@ -1453,14 +1448,14 @@ std::string bambu_network_get_bambulab_host(void *agent_ptr)
 }
 std::string bambu_network_get_user_selected_machine(void *agent_ptr)
 {
+    const std::string selected_device = session_state.selected_device();
     write_diag("bambu_network_get_user_selected_machine: " + selected_device);
     return selected_device;
 }
 int bambu_network_set_user_selected_machine(void *agent_ptr, std::string dev_id)
 {
     write_diag("bambu_network_set_user_selected_machine: " + dev_id);
-    selected_device = dev_id;
-    auto_connect_pending.store(!dev_id.empty());
+    session_state.set_user_selected_device(dev_id);
     persist_selected_device();
     return 0;
 }
@@ -1929,7 +1924,7 @@ int bambu_network_bind_detect(void *agent_ptr, std::string dev_ip, std::string s
     write_diag("bambu_network_bind_detect: dev_ip=" + dev_ip);
     detect.result_msg = "success";
     detect.command = "bind_detect";
-    detect.dev_id = selected_device;
+    detect.dev_id = session_state.selected_device();
     detect.connect_type = "lan";
     return 0;
 }

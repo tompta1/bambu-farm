@@ -10,6 +10,7 @@ BUILD_DIR ?= target/debug/shared
 TEST_BIN ?= target/debug/print_job_test
 CLOUD_TEST_BIN ?= target/debug/cloud_compat_test
 LOCAL_STATE_TEST_BIN ?= target/debug/local_state_test
+SESSION_STATE_TEST_BIN ?= target/debug/session_state_test
 
 shared:
 	cargo build
@@ -54,5 +55,9 @@ test-helpers:
 		cpp/local_state.cpp cpp/local_state_test.cpp \
 		-o "$(LOCAL_STATE_TEST_BIN)"
 	"$(LOCAL_STATE_TEST_BIN)"
+	g++ -std=c++17 -Wall -Wextra -pedantic -Icpp \
+		cpp/session_state.cpp cpp/session_state_test.cpp \
+		-o "$(SESSION_STATE_TEST_BIN)"
+	"$(SESSION_STATE_TEST_BIN)"
 
 test: test-helpers

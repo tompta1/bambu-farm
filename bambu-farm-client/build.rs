@@ -21,6 +21,7 @@ fn main() {
         .file("cpp/cloud_compat.cpp")
         .file("cpp/local_state.cpp")
         .file("cpp/print_job.cpp")
+        .file("cpp/session_state.cpp")
         .include("cpp")
         .flag_if_supported("-std=c++17")
         .flag_if_supported("-Wno-unused-parameter")
