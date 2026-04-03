@@ -30,7 +30,7 @@ What currently works in LAN mode:
 
 What is still limited or incomplete:
 
-- cloud and MakerWorld features are mostly stubbed or intentionally unsupported
+- cloud and MakerWorld features are intentionally unsupported; the plugin now routes the main browser-entry paths to explicit local notice pages instead of pretending they work
 - storage support is aimed at the Studio paths exercised so far, not full parity with the vendor plugin
 - timelapse and large file downloads work, but the tunnel/file APIs have only been hardened for the tested flows
 - the codebase still has a lot of ABI-compatibility glue and global state that should be refactored
@@ -147,7 +147,7 @@ Highest-value follow-up work:
 - replace remaining global/shared state with cleaner session-oriented code
 - expand automated integration coverage beyond upload and storage paths
 - document supported and unsupported Studio/Orca workflows more precisely
-- improve non-LAN feature behavior so unsupported flows fail more explicitly instead of acting like partial stubs
+- continue converting remaining non-LAN partial stubs into explicit unsupported responses
 
 Likely unsupported or intentionally out of scope for now:
 
