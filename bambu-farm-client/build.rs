@@ -18,6 +18,7 @@ fn main() {
 
     cxx_build::bridge("src/api.rs")
         .file("cpp/api.cpp")
+        .file("cpp/callback_registry.cpp")
         .file("cpp/cloud_compat.cpp")
         .file("cpp/local_state.cpp")
         .file("cpp/print_job.cpp")
