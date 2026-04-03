@@ -12,6 +12,7 @@ CLOUD_TEST_BIN ?= target/debug/cloud_compat_test
 LOCAL_STATE_TEST_BIN ?= target/debug/local_state_test
 SESSION_STATE_TEST_BIN ?= target/debug/session_state_test
 CALLBACK_REGISTRY_TEST_BIN ?= target/debug/callback_registry_test
+LOCAL_PRINT_CONTEXT_TEST_BIN ?= target/debug/local_print_context_test
 
 shared:
 	cargo build
@@ -64,5 +65,9 @@ test-helpers:
 		cpp/callback_registry.cpp cpp/callback_registry_test.cpp \
 		-o "$(CALLBACK_REGISTRY_TEST_BIN)"
 	"$(CALLBACK_REGISTRY_TEST_BIN)"
+	g++ -std=c++17 -Wall -Wextra -pedantic -Icpp \
+		cpp/print_job.cpp cpp/local_state.cpp cpp/local_print_context.cpp cpp/local_print_context_test.cpp \
+		-o "$(LOCAL_PRINT_CONTEXT_TEST_BIN)"
+	"$(LOCAL_PRINT_CONTEXT_TEST_BIN)"
 
 test: test-helpers

@@ -1,6 +1,7 @@
 #include "api.hpp"
 #include "callback_registry.hpp"
 #include "cloud_compat.hpp"
+#include "local_print_context.hpp"
 #include "local_state.hpp"
 #include "print_job.hpp"
 #include "session_state.hpp"
@@ -44,8 +45,6 @@ static const char *kLanBackendUrl = "http://127.0.0.1:47403";
 static std::atomic<bool> lan_user_logged_in{true};
 static std::mutex printer_name_overrides_mutex;
 static std::unordered_map<std::string, std::string> printer_name_overrides;
-static std::mutex local_print_context_mutex;
-static void persist_local_print_contexts();
 static std::string last_tunnel_error;
 static std::string preview_payload(const std::string &message, size_t limit = 1024);
 static constexpr size_t kTunnelDownloadChunkSize = 4 * 1024 * 1024;
@@ -69,7 +68,7 @@ struct CompatTunnel
     unsigned long long active_decode_time{0};
 };
 
-static std::unordered_map<std::string, BambuPlugin::LocalPrintContext> local_print_contexts;
+static BambuPlugin::LocalPrintContextStore local_print_context_store;
 
 static void write_diag(const std::string &message);
 
@@ -259,35 +258,6 @@ static std::string json_string_field(const std::string &json, const std::string 
     return json.substr(value_start, value_end - value_start);
 }
 
-static void clear_local_print_context(const std::string &dev_id)
-{
-    if (dev_id.empty()) {
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> lock(local_print_context_mutex);
-        local_print_contexts.erase(dev_id);
-    }
-    persist_local_print_contexts();
-}
-
-static void persist_local_print_contexts()
-{
-    std::unordered_map<std::string, BambuPlugin::LocalPrintContext> snapshot;
-    std::lock_guard<std::mutex> lock(local_print_context_mutex);
-    snapshot = local_print_contexts;
-    BambuPlugin::persist_local_print_contexts(config_dir_path, snapshot, write_diag);
-}
-
-static void load_local_print_contexts()
-{
-    auto loaded = BambuPlugin::load_local_print_contexts(config_dir_path, write_diag);
-    {
-        std::lock_guard<std::mutex> lock(local_print_context_mutex);
-        local_print_contexts = std::move(loaded);
-    }
-}
-
 static void update_local_print_context(
     const BBL::PrintParams &params,
     const std::string &remote_filename,
@@ -308,122 +278,17 @@ static void update_local_print_context(
         BambuPlugin::local_thumbnail_cache_dir(config_dir_path));
     context.thumbnail_url = std::string(thumbnail_url.c_str(), thumbnail_url.size());
     context.active = true;
-
-    {
-        std::lock_guard<std::mutex> lock(local_print_context_mutex);
-        local_print_contexts[params.dev_id] = context;
-    }
-    persist_local_print_contexts();
-
-    write_diag(
-        "update_local_print_context: dev_id=" + context.dev_id +
-        " project_id=" + context.project_id +
-        " profile_id=" + context.profile_id +
-        " subtask_id=" + context.subtask_id +
-        " plate_index=" + std::to_string(context.plate_index) +
-        " thumbnail_url=" + context.thumbnail_url
-    );
+    local_print_context_store.update(context, config_dir_path, write_diag);
 }
 
 static bool lookup_local_print_context_by_subtask_id(const std::string &subtask_id, BambuPlugin::LocalPrintContext &out)
 {
-    std::lock_guard<std::mutex> lock(local_print_context_mutex);
-    for (const auto &[dev_id, context] : local_print_contexts) {
-        if (context.active && context.subtask_id == subtask_id) {
-            out = context;
-            return true;
-        }
-    }
-    return false;
+    return local_print_context_store.lookup_subtask_id(subtask_id, out);
 }
 
 static std::string rewrite_local_print_status_message(const std::string &device_id, const std::string &message)
 {
-    const auto inject_file_capability = [](const std::string &input) -> std::string {
-        const size_t print_key_pos = input.find("\"print\"");
-        if (print_key_pos == std::string::npos) {
-            return input;
-        }
-        const size_t print_object_start = input.find('{', print_key_pos);
-        if (print_object_start == std::string::npos) {
-            return input;
-        }
-
-        const size_t ipcam_key_pos = input.find("\"ipcam\"", print_object_start);
-        if (ipcam_key_pos != std::string::npos) {
-            const size_t ipcam_object_start = input.find('{', ipcam_key_pos);
-            if (ipcam_object_start != std::string::npos) {
-                const size_t ipcam_object_end = input.find('}', ipcam_object_start);
-                if (ipcam_object_end != std::string::npos) {
-                    const std::string ipcam_body =
-                        input.substr(ipcam_object_start, ipcam_object_end - ipcam_object_start);
-                    if (ipcam_body.find("\"file\"") == std::string::npos) {
-                        std::string rewritten = input;
-                        rewritten.insert(
-                            ipcam_object_start + 1,
-                            "\"file\":{\"local\":\"local\",\"remote\":\"none\",\"model_download\":\"disabled\"},");
-                        return rewritten;
-                    }
-                }
-            }
-            return input;
-        }
-
-        std::string rewritten = input;
-        rewritten.insert(
-            print_object_start + 1,
-            "\"ipcam\":{\"file\":{\"local\":\"local\",\"remote\":\"none\",\"model_download\":\"disabled\"}},");
-        return rewritten;
-    };
-
-    const std::string capability_message = inject_file_capability(message);
-    BambuPlugin::LocalPrintContext context;
-    {
-        std::lock_guard<std::mutex> lock(local_print_context_mutex);
-        const auto it = local_print_contexts.find(device_id);
-        if (it == local_print_contexts.end() || !it->second.active) {
-            return capability_message;
-        }
-        context = it->second;
-    }
-
-    const size_t print_key_pos = capability_message.find("\"print\"");
-    if (print_key_pos == std::string::npos) {
-        return capability_message;
-    }
-    const size_t object_start = capability_message.find('{', print_key_pos);
-    if (object_start == std::string::npos) {
-        return capability_message;
-    }
-
-    const bool has_project_id = capability_message.find("\"project_id\"", print_key_pos) != std::string::npos;
-    const bool has_profile_id = capability_message.find("\"profile_id\"", print_key_pos) != std::string::npos;
-    const bool has_subtask_id = capability_message.find("\"subtask_id\"", print_key_pos) != std::string::npos;
-    const bool has_task_id = capability_message.find("\"task_id\"", print_key_pos) != std::string::npos;
-    if (has_project_id && has_profile_id && has_subtask_id && has_task_id) {
-        return capability_message;
-    }
-
-    std::string injected;
-    if (!has_project_id) {
-        injected += "\"project_id\":\"" + BambuPlugin::json_escape(context.project_id) + "\",";
-    }
-    if (!has_profile_id) {
-        injected += "\"profile_id\":\"" + BambuPlugin::json_escape(context.profile_id) + "\",";
-    }
-    if (!has_subtask_id) {
-        injected += "\"subtask_id\":\"" + BambuPlugin::json_escape(context.subtask_id) + "\",";
-    }
-    if (!has_task_id) {
-        injected += "\"task_id\":\"" + BambuPlugin::json_escape(context.task_id) + "\",";
-    }
-    if (injected.empty()) {
-        return message;
-    }
-
-    std::string rewritten = capability_message;
-    rewritten.insert(object_start + 1, injected);
-    return rewritten;
+    return local_print_context_store.rewrite_status_message(device_id, message);
 }
 
 static std::string apply_printer_name_override(const std::string &json)
@@ -1139,7 +1004,7 @@ int bambu_network_set_config_dir(void *agent_ptr, std::string config_dir)
     config_dir_path = config_dir;
     load_selected_device();
     load_printer_name_overrides();
-    load_local_print_contexts();
+    local_print_context_store.load(config_dir_path, write_diag);
     return 0;
 }
 int bambu_network_set_cert_file(void *agent_ptr, std::string folder, std::string filename)
@@ -1319,7 +1184,7 @@ int bambu_network_user_logout(void *agent_ptr, bool request)
     const std::string target = session_state.disconnect_target();
     if (!target.empty()) {
         bambu_network_rs_disconnect(target);
-        clear_local_print_context(target);
+        local_print_context_store.clear(target, config_dir_path, write_diag);
     }
     session_state.clear_after_logout();
     persist_selected_device();
