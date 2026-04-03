@@ -900,6 +900,7 @@ impl BambuFarm for Farm {
                             } else {
                                 printer.model.clone()
                             },
+                            host: printer.ip.clone(),
                         })
                         .collect(),
                 };
@@ -1318,6 +1319,72 @@ mod tests {
             construct_printer(test_printer_config(Some("192.0.2.10"))).expect("printer config");
 
         assert_eq!(printer.ip, "192.0.2.10");
+    }
+
+    #[test]
+    fn resolve_connect_password_prefers_request_password() {
+        let farm = Farm::default();
+        let printer = Printer {
+            name: "Test Printer".to_string(),
+            id: "TESTDEVICE123456".to_string(),
+            ip: String::new(),
+            model: String::new(),
+            password: "config-secret".to_string(),
+        };
+        let request = ConnectRequest {
+            dev_id: printer.id.clone(),
+            password: "runtime-secret".to_string(),
+        };
+
+        let password = farm
+            .resolve_connect_password(&printer, &request)
+            .expect("runtime password");
+
+        assert_eq!(password, "runtime-secret");
+    }
+
+    #[test]
+    fn resolve_connect_password_uses_config_password_when_request_missing() {
+        let farm = Farm::default();
+        let printer = Printer {
+            name: "Test Printer".to_string(),
+            id: "TESTDEVICE123456".to_string(),
+            ip: String::new(),
+            model: String::new(),
+            password: "config-secret".to_string(),
+        };
+        let request = ConnectRequest {
+            dev_id: printer.id.clone(),
+            password: String::new(),
+        };
+
+        let password = farm
+            .resolve_connect_password(&printer, &request)
+            .expect("config password");
+
+        assert_eq!(password, "config-secret");
+    }
+
+    #[test]
+    fn resolve_connect_password_rejects_missing_password_everywhere() {
+        let farm = Farm::default();
+        let printer = Printer {
+            name: "Test Printer".to_string(),
+            id: "TESTDEVICE123456".to_string(),
+            ip: String::new(),
+            model: String::new(),
+            password: String::new(),
+        };
+        let request = ConnectRequest {
+            dev_id: printer.id.clone(),
+            password: String::new(),
+        };
+
+        let error = farm
+            .resolve_connect_password(&printer, &request)
+            .expect_err("missing password should fail");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
     }
 
     #[test]
