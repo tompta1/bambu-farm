@@ -618,7 +618,16 @@ fn emit_disconnect_event_if_active(device_id: &str, generation: u64, status: i32
 
 fn emit_available_printer(printer: bambu_farm::PrinterOption) {
     let printer_host = if printer.host.trim().is_empty() {
-        printer_host_for_device(&printer.dev_id).unwrap_or_else(|| "127.0.0.1".into())
+        match printer_host_for_device(&printer.dev_id) {
+            Some(host) if !host.trim().is_empty() => host,
+            _ => {
+                bambu_network_rs_log_debug(format!(
+                    "bambu_network_rs_emit_available_printer: skipping undiscovered printer dev_id={} dev_name={} model={}",
+                    printer.dev_id, printer.dev_name, printer.model
+                ));
+                return;
+            }
+        }
     } else {
         printer.host.clone()
     };

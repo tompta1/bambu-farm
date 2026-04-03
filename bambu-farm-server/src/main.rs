@@ -145,6 +145,28 @@ fn model_code_from_product_name(product_name: &str) -> Option<&'static str> {
     }
 }
 
+fn display_name_from_model_code(model: &str) -> Option<&'static str> {
+    match model.trim() {
+        "3DPrinter-X1-Carbon" => Some("Bambu Lab X1 Carbon"),
+        "3DPrinter-X1" => Some("Bambu Lab X1"),
+        "C12" => Some("Bambu Lab P1S"),
+        "C11" => Some("Bambu Lab P1P"),
+        "N1" => Some("Bambu Lab A1 mini"),
+        "N2S" => Some("Bambu Lab A1"),
+        _ => None,
+    }
+}
+
+fn preferred_printer_display_name(printer: &Printer) -> String {
+    if !printer.name.trim().is_empty() {
+        return printer.name.clone();
+    }
+    if let Some(name) = display_name_from_model_code(&printer.model) {
+        return name.to_string();
+    }
+    format!("Bambu {}", printer.id)
+}
+
 fn discovery_match_from_payload(candidate_ip: Ipv4Addr, payload: &str) -> DiscoveryMatch {
     let root: JsonValue = serde_json::from_str(payload).unwrap_or(JsonValue::Null);
     let modules = root
@@ -842,6 +864,13 @@ impl Farm {
             resolved.name = discovered
                 .name
                 .clone()
+                .or_else(|| {
+                    discovered
+                        .model
+                        .as_deref()
+                        .and_then(display_name_from_model_code)
+                        .map(str::to_string)
+                })
                 .unwrap_or_else(|| format!("Bambu {}", resolved.id));
         }
         if resolved.model.trim().is_empty() {
@@ -1010,11 +1039,7 @@ impl BambuFarm for Farm {
                     options: printers
                         .iter()
                         .map(|printer| PrinterOption {
-                            dev_name: if printer.name.trim().is_empty() {
-                                format!("Bambu {}", printer.id)
-                            } else {
-                                printer.name.clone()
-                            },
+                            dev_name: preferred_printer_display_name(printer),
                             dev_id: printer.id.clone(),
                             model: if printer.model.trim().is_empty() {
                                 "unknown".to_string()
