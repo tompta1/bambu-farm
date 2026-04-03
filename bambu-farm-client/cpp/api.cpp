@@ -4,6 +4,7 @@
 #include "local_print_context.hpp"
 #include "local_state.hpp"
 #include "printer_metadata.hpp"
+#include "print_flow.hpp"
 #include "print_job.hpp"
 #include "session_state.hpp"
 #include "tunnel_bridge.hpp"
@@ -244,20 +245,6 @@ static void log_print_params(const char *fn, const PrintParams &params)
     );
 }
 
-static void report_update_status(OnUpdateStatusFn update_fn, int status, int code, const std::string &message)
-{
-    write_diag(
-        "report_update_status: status=" + std::to_string(status) +
-        " code=" + std::to_string(code) +
-        " message=" + message +
-        " callback=" + (update_fn ? "set" : "null")
-    );
-    if (!update_fn) {
-        return;
-    }
-    update_fn(status, code, message);
-}
-
 static void log_local_file_probe(const char *context, const std::string &path)
 {
     errno = 0;
@@ -279,67 +266,6 @@ static void log_local_file_probe(const char *context, const std::string &path)
         " local_file_probe=open_ok path=" + path +
         " size=" + std::to_string(static_cast<long long>(end_pos))
     );
-}
-
-static int start_local_print_impl(const PrintParams &params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
-{
-    log_print_params("bambu_network_start_local_print", params);
-    report_update_status(update_fn, PrintingStageCreate, BAMBU_NETWORK_SUCCESS, "Preparing print");
-
-    if (cancel_fn && cancel_fn()) {
-        report_update_status(update_fn, PrintingStageERROR, BAMBU_NETWORK_ERR_CANCELED, "Canceled");
-        return BAMBU_NETWORK_ERR_CANCELED;
-    }
-
-    const std::string remote_filename = BambuPlugin::resolve_remote_filename(params);
-    const std::string plate_path = BambuPlugin::resolve_plate_metadata_path(params);
-
-    report_update_status(update_fn, PrintingStageUpload, BAMBU_NETWORK_SUCCESS, "Uploading to printer");
-    log_local_file_probe("bambu_network_start_local_print", params.filename);
-    const int upload_result = bambu_network_rs_upload_file(params.dev_id, params.filename, remote_filename);
-    write_diag(
-        "bambu_network_start_local_print upload_result=" +
-        std::to_string(upload_result) +
-        " remote_filename=" + remote_filename +
-        " plate_path=" + plate_path
-    );
-    if (upload_result != BAMBU_NETWORK_SUCCESS) {
-        report_update_status(update_fn, PrintingStageERROR, upload_result, "Upload failed");
-        return BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED;
-    }
-
-    update_local_print_context(params, remote_filename, plate_path);
-
-    if (cancel_fn && cancel_fn()) {
-        report_update_status(update_fn, PrintingStageERROR, BAMBU_NETWORK_ERR_CANCELED, "Canceled");
-        return BAMBU_NETWORK_ERR_CANCELED;
-    }
-
-    report_update_status(update_fn, PrintingStageSending, BAMBU_NETWORK_SUCCESS, "Sending print command");
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-
-    std::string json = BambuPlugin::build_project_file_command(params, remote_filename, plate_path);
-    write_diag("bambu_network_start_local_print command=" + json);
-
-    const int send_result = bambu_network_rs_send(params.dev_id, json);
-    write_diag("bambu_network_start_local_print send_result=" + std::to_string(send_result));
-    if (send_result != BAMBU_NETWORK_SUCCESS) {
-        report_update_status(update_fn, PrintingStageERROR, send_result, "Send failed");
-        return BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
-    }
-
-    if (wait_fn) {
-        report_update_status(update_fn, PrintingStageWaitPrinter, BAMBU_NETWORK_SUCCESS, "Waiting for printer");
-        const bool wait_ok = wait_fn(PrintingStageWaitPrinter, "{}");
-        write_diag(std::string("bambu_network_start_local_print wait_result=") + (wait_ok ? "true" : "false"));
-        if (!wait_ok) {
-            report_update_status(update_fn, PrintingStageERROR, BAMBU_NETWORK_ERR_TIMEOUT, "Wait failed");
-            return BAMBU_NETWORK_ERR_TIMEOUT;
-        }
-    }
-
-    report_update_status(update_fn, PrintingStageFinished, BAMBU_NETWORK_SUCCESS, "Print submitted");
-    return BAMBU_NETWORK_SUCCESS;
 }
 
 void bambu_init() {
@@ -788,41 +714,41 @@ int bambu_network_set_user_selected_machine(void *agent_ptr, std::string dev_id)
 int bambu_network_start_print(void *agent_ptr, PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
     write_diag("bambu_network_start_print");
-    return start_local_print_impl(params, update_fn, cancel_fn, wait_fn);
+    BambuPlugin::PrintFlowDeps deps;
+    deps.log_diag = write_diag;
+    deps.log_print_params = log_print_params;
+    deps.log_local_file_probe = log_local_file_probe;
+    deps.upload_file = [](const std::string &dev_id, const std::string &filename, const std::string &remote_filename) {
+        return bambu_network_rs_upload_file(dev_id, filename, remote_filename);
+    };
+    deps.send_message = [](const std::string &dev_id, const std::string &json) {
+        return bambu_network_rs_send(dev_id, json);
+    };
+    deps.update_local_context = update_local_print_context;
+    deps.sleep_before_send = []() { std::this_thread::sleep_for(std::chrono::seconds(1)); };
+    return BambuPlugin::start_local_print(params, update_fn, cancel_fn, wait_fn, deps);
 }
 int bambu_network_start_local_print_with_record(void *agent_ptr, PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
     LOG_CALL();
-    return start_local_print_impl(params, update_fn, cancel_fn, wait_fn);
+    return bambu_network_start_print(agent_ptr, params, update_fn, cancel_fn, wait_fn);
 }
 int bambu_network_start_send_gcode_to_sdcard(void *agent_ptr, PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
     LOG_CALL_ARGS("%s %s %s %s", params.project_name.c_str(), params.filename.c_str(), params.ftp_file.c_str(), params.dst_file.c_str());
-    log_print_params("bambu_network_start_send_gcode_to_sdcard", params);
-    report_update_status(update_fn, PrintingStageCreate, BAMBU_NETWORK_SUCCESS, "Preparing upload");
-
-    const std::string remote_filename = BambuPlugin::resolve_remote_filename(params);
-    report_update_status(update_fn, PrintingStageUpload, BAMBU_NETWORK_SUCCESS, "Uploading to printer");
-    log_local_file_probe("bambu_network_start_send_gcode_to_sdcard", params.filename);
-    const int upload_result = bambu_network_rs_upload_file(params.dev_id, params.filename, remote_filename);
-    write_diag(
-        "bambu_network_start_send_gcode_to_sdcard upload_result=" +
-        std::to_string(upload_result) +
-        " remote_filename=" + remote_filename
-    );
-
-    if (upload_result != BAMBU_NETWORK_SUCCESS) {
-        report_update_status(update_fn, PrintingStageERROR, upload_result, "Upload failed");
-        return BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED;
-    }
-
-    report_update_status(update_fn, PrintingStageFinished, BAMBU_NETWORK_SUCCESS, "Upload finished");
-    return BAMBU_NETWORK_SUCCESS;
+    BambuPlugin::PrintFlowDeps deps;
+    deps.log_diag = write_diag;
+    deps.log_print_params = log_print_params;
+    deps.log_local_file_probe = log_local_file_probe;
+    deps.upload_file = [](const std::string &dev_id, const std::string &filename, const std::string &remote_filename) {
+        return bambu_network_rs_upload_file(dev_id, filename, remote_filename);
+    };
+    return BambuPlugin::start_send_gcode_to_sdcard(params, update_fn, deps);
 }
 int bambu_network_start_local_print(void *agent_ptr, PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn)
 {
     LOG_CALL_ARGS("%s %s %s", params.project_name.c_str(), params.filename.c_str(), params.ams_mapping.c_str());
-    return start_local_print_impl(params, update_fn, cancel_fn, nullptr);
+    return bambu_network_start_print(agent_ptr, params, update_fn, cancel_fn, nullptr);
 }
 int bambu_network_get_user_presets(void *agent_ptr, std::map<std::string, std::map<std::string, std::string>> *user_presets)
 {
@@ -948,7 +874,14 @@ int bambu_network_start_publish(void *agent_ptr, PublishParams params, OnUpdateS
     if (out) {
         *out = BambuPlugin::unsupported_cloud_json("publish");
     }
-    report_update_status(update_fn, PrintingStageERROR, BAMBU_NETWORK_ERR_INVALID_RESULT, message);
+    write_diag(
+        "report_update_status: status=" + std::to_string(PrintingStageERROR) +
+        " code=" + std::to_string(BAMBU_NETWORK_ERR_INVALID_RESULT) +
+        " message=" + message +
+        " callback=" + (update_fn ? "set" : "null"));
+    if (update_fn) {
+        update_fn(PrintingStageERROR, BAMBU_NETWORK_ERR_INVALID_RESULT, message);
+    }
     return BAMBU_NETWORK_ERR_INVALID_RESULT;
 }
 int bambu_network_get_profile_3mf(void *agent_ptr, BBLProfile *profile)
@@ -1178,33 +1111,13 @@ int bambu_network_get_user_tasks(void *agent_ptr, TaskQueryParams params, std::s
 int bambu_network_start_sdcard_print(void *agent_ptr, PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn)
 {
     LOG_CALL_ARGS("%s %s %s", params.project_name.c_str(), params.filename.c_str(), params.dst_file.c_str());
-    log_print_params("bambu_network_start_sdcard_print", params);
-
-    const std::string plate_path = !params.dst_file.empty() ? params.dst_file : BambuPlugin::resolve_plate_metadata_path(params);
-    std::string remote_filename = BambuPlugin::basename_or_empty(plate_path);
-    if (remote_filename.empty()) {
-        remote_filename = BambuPlugin::resolve_remote_filename(params);
-    }
-
-    report_update_status(update_fn, PrintingStageCreate, BAMBU_NETWORK_SUCCESS, "Preparing print");
-    if (cancel_fn && cancel_fn()) {
-        report_update_status(update_fn, PrintingStageERROR, BAMBU_NETWORK_ERR_CANCELED, "Canceled");
-        return BAMBU_NETWORK_ERR_CANCELED;
-    }
-
-    report_update_status(update_fn, PrintingStageSending, BAMBU_NETWORK_SUCCESS, "Sending print command");
-    std::string json = BambuPlugin::build_project_file_command(params, remote_filename, plate_path);
-    write_diag("bambu_network_start_sdcard_print command=" + json);
-
-    const int send_result = bambu_network_rs_send(params.dev_id, json);
-    write_diag("bambu_network_start_sdcard_print send_result=" + std::to_string(send_result));
-    if (send_result != BAMBU_NETWORK_SUCCESS) {
-        report_update_status(update_fn, PrintingStageERROR, send_result, "Send failed");
-        return BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
-    }
-
-    report_update_status(update_fn, PrintingStageFinished, BAMBU_NETWORK_SUCCESS, "Print submitted");
-    return BAMBU_NETWORK_SUCCESS;
+    BambuPlugin::PrintFlowDeps deps;
+    deps.log_diag = write_diag;
+    deps.log_print_params = log_print_params;
+    deps.send_message = [](const std::string &dev_id, const std::string &json) {
+        return bambu_network_rs_send(dev_id, json);
+    };
+    return BambuPlugin::start_sdcard_print(params, update_fn, cancel_fn, deps);
 }
 
 int bambu_network_update_cert(void *agent_ptr)
