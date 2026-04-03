@@ -25,6 +25,8 @@ fn main() {
         .file("cpp/printer_metadata.cpp")
         .file("cpp/print_job.cpp")
         .file("cpp/session_state.cpp")
+        .file("cpp/tunnel_bridge.cpp")
+        .file("cpp/tunnel_protocol.cpp")
         .include("cpp")
         .flag_if_supported("-std=c++17")
         .flag_if_supported("-Wno-unused-parameter")
