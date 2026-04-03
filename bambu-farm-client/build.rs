@@ -18,6 +18,7 @@ fn main() {
 
     cxx_build::bridge("src/api.rs")
         .file("cpp/api.cpp")
+        .file("cpp/cloud_compat.cpp")
         .file("cpp/print_job.cpp")
         .include("cpp")
         .flag_if_supported("-std=c++17")
