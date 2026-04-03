@@ -9,6 +9,7 @@ SERVER_CONFIG_EXAMPLE ?= ../bambu-farm-server/bambufarm_example.toml
 BUILD_DIR ?= target/debug/shared
 TEST_BIN ?= target/debug/print_job_test
 CLOUD_TEST_BIN ?= target/debug/cloud_compat_test
+LOCAL_STATE_TEST_BIN ?= target/debug/local_state_test
 
 shared:
 	cargo build
@@ -49,5 +50,9 @@ test-helpers:
 		cpp/print_job.cpp cpp/cloud_compat.cpp cpp/cloud_compat_test.cpp \
 		-o "$(CLOUD_TEST_BIN)"
 	"$(CLOUD_TEST_BIN)"
+	g++ -std=c++17 -Wall -Wextra -pedantic -Icpp \
+		cpp/local_state.cpp cpp/local_state_test.cpp \
+		-o "$(LOCAL_STATE_TEST_BIN)"
+	"$(LOCAL_STATE_TEST_BIN)"
 
 test: test-helpers

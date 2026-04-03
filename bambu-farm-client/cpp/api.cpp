@@ -1,5 +1,6 @@
 #include "api.hpp"
 #include "cloud_compat.hpp"
+#include "local_state.hpp"
 #include "print_job.hpp"
 #include "stdio.h"
 
@@ -79,21 +80,7 @@ struct CompatTunnel
     unsigned long long active_decode_time{0};
 };
 
-struct LocalPrintContext
-{
-    std::string dev_id;
-    std::string project_id;
-    std::string profile_id;
-    std::string subtask_id;
-    std::string task_id;
-    std::string remote_filename;
-    std::string plate_path;
-    std::string thumbnail_url;
-    int plate_index{-1};
-    bool active{false};
-};
-
-static std::unordered_map<std::string, LocalPrintContext> local_print_contexts;
+static std::unordered_map<std::string, BambuPlugin::LocalPrintContext> local_print_contexts;
 
 static void write_diag(const std::string &message);
 
@@ -240,74 +227,6 @@ static std::vector<std::string> split_file_download_response_frames(const std::s
     return frames;
 }
 
-static std::string selected_device_state_path()
-{
-    if (!config_dir_path.empty()) {
-        return config_dir_path + "/oss-last-device.txt";
-    }
-
-    const char *xdg = std::getenv("XDG_CONFIG_HOME");
-    const char *home = std::getenv("HOME");
-    if (xdg && *xdg) {
-        return std::string(xdg) + "/BambuStudio/oss-last-device.txt";
-    }
-    if (home && *home) {
-        return std::string(home) + "/.config/BambuStudio/oss-last-device.txt";
-    }
-    return "/tmp/bambu-oss-last-device.txt";
-}
-
-static std::string printer_names_state_path()
-{
-    if (!config_dir_path.empty()) {
-        return config_dir_path + "/oss-printer-names.tsv";
-    }
-
-    const char *xdg = std::getenv("XDG_CONFIG_HOME");
-    const char *home = std::getenv("HOME");
-    if (xdg && *xdg) {
-        return std::string(xdg) + "/BambuStudio/oss-printer-names.tsv";
-    }
-    if (home && *home) {
-        return std::string(home) + "/.config/BambuStudio/oss-printer-names.tsv";
-    }
-    return "/tmp/bambu-oss-printer-names.tsv";
-}
-
-static std::string local_thumbnail_cache_dir()
-{
-    if (!config_dir_path.empty()) {
-        return config_dir_path + "/oss-thumbnails";
-    }
-
-    const char *xdg = std::getenv("XDG_CONFIG_HOME");
-    const char *home = std::getenv("HOME");
-    if (xdg && *xdg) {
-        return std::string(xdg) + "/BambuStudio/oss-thumbnails";
-    }
-    if (home && *home) {
-        return std::string(home) + "/.config/BambuStudio/oss-thumbnails";
-    }
-    return "/tmp/bambu-oss-thumbnails";
-}
-
-static std::string local_print_contexts_state_path()
-{
-    if (!config_dir_path.empty()) {
-        return config_dir_path + "/oss-local-print-contexts.tsv";
-    }
-
-    const char *xdg = std::getenv("XDG_CONFIG_HOME");
-    const char *home = std::getenv("HOME");
-    if (xdg && *xdg) {
-        return std::string(xdg) + "/BambuStudio/oss-local-print-contexts.tsv";
-    }
-    if (home && *home) {
-        return std::string(home) + "/.config/BambuStudio/oss-local-print-contexts.tsv";
-    }
-    return "/tmp/bambu-oss-local-print-contexts.tsv";
-}
-
 static std::string synthetic_local_id(const char *prefix, const std::string &dev_id, const std::string &remote_filename)
 {
     std::hash<std::string> hasher;
@@ -365,85 +284,19 @@ static void clear_local_print_context(const std::string &dev_id)
 
 static void persist_local_print_contexts()
 {
-    const std::string path = local_print_contexts_state_path();
-    std::error_code ec;
-    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-
-    std::ofstream out(path, std::ios::trunc);
-    if (!out.is_open()) {
-        write_diag("persist_local_print_contexts: failed path=" + path);
-        return;
-    }
-
+    std::unordered_map<std::string, BambuPlugin::LocalPrintContext> snapshot;
     std::lock_guard<std::mutex> lock(local_print_context_mutex);
-    for (const auto &[dev_id, context] : local_print_contexts) {
-        if (!context.active || dev_id.empty()) {
-            continue;
-        }
-        out
-            << context.dev_id << '\t'
-            << context.project_id << '\t'
-            << context.profile_id << '\t'
-            << context.subtask_id << '\t'
-            << context.task_id << '\t'
-            << context.remote_filename << '\t'
-            << context.plate_path << '\t'
-            << context.thumbnail_url << '\t'
-            << context.plate_index << '\n';
-    }
-    write_diag("persist_local_print_contexts: wrote path=" + path);
+    snapshot = local_print_contexts;
+    BambuPlugin::persist_local_print_contexts(config_dir_path, snapshot, write_diag);
 }
 
 static void load_local_print_contexts()
 {
-    const std::string path = local_print_contexts_state_path();
-    std::ifstream in(path);
-    if (!in.is_open()) {
-        write_diag("load_local_print_contexts: no state path=" + path);
-        return;
-    }
-
-    std::unordered_map<std::string, LocalPrintContext> loaded;
-    std::string line;
-    while (std::getline(in, line)) {
-        std::vector<std::string> fields;
-        size_t start = 0;
-        while (true) {
-            const size_t tab = line.find('\t', start);
-            if (tab == std::string::npos) {
-                fields.push_back(line.substr(start));
-                break;
-            }
-            fields.push_back(line.substr(start, tab - start));
-            start = tab + 1;
-        }
-        if (fields.size() != 9 || fields[0].empty()) {
-            continue;
-        }
-
-        LocalPrintContext context;
-        context.dev_id = fields[0];
-        context.project_id = fields[1];
-        context.profile_id = fields[2];
-        context.subtask_id = fields[3];
-        context.task_id = fields[4];
-        context.remote_filename = fields[5];
-        context.plate_path = fields[6];
-        context.thumbnail_url = fields[7];
-        try {
-            context.plate_index = std::stoi(fields[8]);
-        } catch (...) {
-            context.plate_index = 0;
-        }
-        context.active = true;
-        loaded[context.dev_id] = context;
-    }
-
+    auto loaded = BambuPlugin::load_local_print_contexts(config_dir_path, write_diag);
     {
         std::lock_guard<std::mutex> lock(local_print_context_mutex);
         local_print_contexts = std::move(loaded);
     }
-    write_diag("load_local_print_contexts: loaded path=" + path);
 }
 
 static void update_local_print_context(
@@ -451,7 +304,7 @@ static void update_local_print_context(
     const std::string &remote_filename,
     const std::string &plate_path)
 {
-    LocalPrintContext context;
+    BambuPlugin::LocalPrintContext context;
     context.dev_id = params.dev_id;
     context.project_id = synthetic_local_id("local-project", params.dev_id, remote_filename);
     context.profile_id = synthetic_local_id("local-profile", params.dev_id, remote_filename);
@@ -463,7 +316,7 @@ static void update_local_print_context(
     rust::String thumbnail_url = bambu_network_rs_extract_3mf_thumbnail(
         params.filename,
         params.plate_index,
-        local_thumbnail_cache_dir());
+        BambuPlugin::local_thumbnail_cache_dir(config_dir_path));
     context.thumbnail_url = std::string(thumbnail_url.c_str(), thumbnail_url.size());
     context.active = true;
 
@@ -483,7 +336,7 @@ static void update_local_print_context(
     );
 }
 
-static bool lookup_local_print_context_by_subtask_id(const std::string &subtask_id, LocalPrintContext &out)
+static bool lookup_local_print_context_by_subtask_id(const std::string &subtask_id, BambuPlugin::LocalPrintContext &out)
 {
     std::lock_guard<std::mutex> lock(local_print_context_mutex);
     for (const auto &[dev_id, context] : local_print_contexts) {
@@ -535,7 +388,7 @@ static std::string rewrite_local_print_status_message(const std::string &device_
     };
 
     const std::string capability_message = inject_file_capability(message);
-    LocalPrintContext context;
+    BambuPlugin::LocalPrintContext context;
     {
         std::lock_guard<std::mutex> lock(local_print_context_mutex);
         const auto it = local_print_contexts.find(device_id);
@@ -614,95 +467,35 @@ static std::string apply_printer_name_override(const std::string &json)
 
 static void persist_printer_name_overrides()
 {
-    const std::string path = printer_names_state_path();
-    std::error_code ec;
-    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-
-    std::ofstream out(path, std::ios::trunc);
-    if (!out.is_open()) {
-        write_diag("persist_printer_name_overrides: failed path=" + path);
-        return;
-    }
-
+    std::unordered_map<std::string, std::string> snapshot;
     std::lock_guard<std::mutex> lock(printer_name_overrides_mutex);
-    for (const auto &[dev_id, name] : printer_name_overrides) {
-        if (!dev_id.empty() && !name.empty()) {
-            out << dev_id << '\t' << name << '\n';
-        }
-    }
-    write_diag("persist_printer_name_overrides: wrote path=" + path);
+    snapshot = printer_name_overrides;
+    BambuPlugin::persist_printer_name_overrides(config_dir_path, snapshot, write_diag);
 }
 
 static void load_printer_name_overrides()
 {
-    const std::string path = printer_names_state_path();
-    std::ifstream in(path);
-    if (!in.is_open()) {
-        write_diag("load_printer_name_overrides: no state path=" + path);
-        return;
-    }
-
-    std::unordered_map<std::string, std::string> loaded;
-    std::string line;
-    while (std::getline(in, line)) {
-        const size_t tab_pos = line.find('\t');
-        if (tab_pos == std::string::npos) {
-            continue;
-        }
-        const std::string dev_id = line.substr(0, tab_pos);
-        const std::string name = line.substr(tab_pos + 1);
-        if (!dev_id.empty() && !name.empty()) {
-            loaded[dev_id] = name;
-        }
-    }
-
+    auto loaded = BambuPlugin::load_printer_name_overrides(config_dir_path, write_diag);
     {
         std::lock_guard<std::mutex> lock(printer_name_overrides_mutex);
         printer_name_overrides = std::move(loaded);
     }
-    write_diag("load_printer_name_overrides: loaded path=" + path);
 }
 
 static void persist_selected_device()
 {
-    const std::string path = selected_device_state_path();
-    std::error_code ec;
-    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-
-    if (selected_device.empty()) {
-        std::filesystem::remove(path, ec);
-        write_diag("persist_selected_device: cleared path=" + path);
-        return;
-    }
-
-    std::ofstream out(path, std::ios::trunc);
-    if (!out.is_open()) {
-        write_diag("persist_selected_device: failed path=" + path);
-        return;
-    }
-    out << selected_device;
-    write_diag("persist_selected_device: wrote dev_id=" + selected_device + " path=" + path);
+    BambuPlugin::persist_selected_device(config_dir_path, selected_device, write_diag);
 }
 
 static void load_selected_device()
 {
-    const std::string path = selected_device_state_path();
-    std::ifstream in(path);
-    if (!in.is_open()) {
-        write_diag("load_selected_device: no state path=" + path);
-        return;
-    }
-
-    std::string loaded;
-    std::getline(in, loaded);
+    std::string loaded = BambuPlugin::load_selected_device(config_dir_path, write_diag);
     if (loaded.empty()) {
-        write_diag("load_selected_device: empty state path=" + path);
         return;
     }
 
     selected_device = loaded;
     auto_connect_pending.store(true);
-    write_diag("load_selected_device: dev_id=" + selected_device + " path=" + path);
 }
 
 static bool printer_json_matches_selected_device(const std::string &json)
@@ -2012,7 +1805,7 @@ BAMBU_COMPAT_STUB(bambu_network_del_rating_picture_oss)
 int bambu_network_get_subtask_info(void *agent_ptr, std::string subtask_id, std::string *task_json, unsigned int *http_code, std::string *http_body)
 {
     LOG_CALL();
-    LocalPrintContext context;
+    BambuPlugin::LocalPrintContext context;
     if (!lookup_local_print_context_by_subtask_id(subtask_id, context)) {
         write_diag("bambu_network_get_subtask_info: not found subtask_id=" + subtask_id);
         if (http_code) {
