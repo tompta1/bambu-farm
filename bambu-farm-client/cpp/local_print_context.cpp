@@ -53,6 +53,49 @@ namespace BambuPlugin
         return false;
     }
 
+    bool LocalPrintContextStore::build_subtask_info(
+        const std::string &subtask_id,
+        std::string *task_json,
+        unsigned int *http_code,
+        std::string *http_body
+    ) const
+    {
+        LocalPrintContext context;
+        if (!lookup_subtask_id(subtask_id, context)) {
+            if (http_code) {
+                *http_code = 404;
+            }
+            if (http_body) {
+                *http_body = "{\"error\":\"not_found\"}";
+            }
+            if (task_json) {
+                task_json->clear();
+            }
+            return false;
+        }
+
+        if (http_code) {
+            *http_code = 200;
+        }
+        if (http_body) {
+            *http_body = "{}";
+        }
+        if (task_json) {
+            *task_json =
+                "{"
+                "\"content\":\"{\\\"info\\\":{\\\"plate_idx\\\":" + std::to_string(context.plate_index) + "}}\","
+                "\"context\":{"
+                "\"plates\":[{"
+                "\"index\":" + std::to_string(context.plate_index) + ","
+                "\"thumbnail\":{\"url\":\"" + BambuPlugin::json_escape(context.thumbnail_url) + "\"},"
+                "\"filaments\":[]"
+                "}]"
+                "}"
+                "}";
+        }
+        return true;
+    }
+
     std::string LocalPrintContextStore::rewrite_status_message(const std::string &device_id, const std::string &message) const
     {
         const auto inject_file_capability = [](const std::string &input) -> std::string {

@@ -19,6 +19,12 @@ namespace BambuPlugin
         void clear(const std::string &dev_id, const std::string &config_dir, const DiagLogFn &log_fn);
         void update(const LocalPrintContext &context, const std::string &config_dir, const DiagLogFn &log_fn);
         bool lookup_subtask_id(const std::string &subtask_id, LocalPrintContext &out) const;
+        bool build_subtask_info(
+            const std::string &subtask_id,
+            std::string *task_json,
+            unsigned int *http_code,
+            std::string *http_body
+        ) const;
         std::string rewrite_status_message(const std::string &device_id, const std::string &message) const;
 
     private:

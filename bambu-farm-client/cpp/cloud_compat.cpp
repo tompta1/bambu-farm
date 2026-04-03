@@ -58,6 +58,27 @@ namespace BambuPlugin
             "}";
     }
 
+    std::string unsupported_user_tasks_json()
+    {
+        return
+            "{"
+            "\"total\":0,"
+            "\"hits\":[],"
+            "\"unsupported\":true,"
+            "\"message\":\"Cloud print history is not supported by the OSS LAN plugin.\""
+            "}";
+    }
+
+    void fill_unsupported_my_profile(unsigned int *http_code, std::string *http_body)
+    {
+        if (http_code) {
+            *http_code = 501;
+        }
+        if (http_body) {
+            *http_body = unsupported_cloud_json("my_profile");
+        }
+    }
+
     std::string ensure_cloud_notice_file(
         const std::string &config_dir,
         const std::string &relative_path,
@@ -93,5 +114,35 @@ namespace BambuPlugin
         out.close();
 
         return "file://" + file_path.generic_string();
+    }
+
+    std::string model_publish_notice_url(const std::string &config_dir)
+    {
+        return ensure_cloud_notice_file(
+            config_dir,
+            "publish.html",
+            "Model Publishing Not Supported",
+            "Publishing models from the OSS LAN plugin is currently out of scope."
+        );
+    }
+
+    std::string model_mall_home_notice_url(const std::string &config_dir)
+    {
+        return ensure_cloud_notice_file(
+            config_dir,
+            "makerworld-home.html",
+            "MakerWorld Not Supported",
+            "MakerWorld browsing is currently disabled in the OSS LAN plugin."
+        );
+    }
+
+    std::string model_mall_detail_notice_url(const std::string &config_dir, const std::string &id)
+    {
+        return ensure_cloud_notice_file(
+            config_dir,
+            "makerworld-model-" + BambuPlugin::sanitize_remote_filename(id) + ".html",
+            "MakerWorld Model Not Supported",
+            "MakerWorld model detail pages are currently disabled in the OSS LAN plugin."
+        );
     }
 }

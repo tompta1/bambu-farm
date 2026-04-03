@@ -50,10 +50,33 @@ static void test_rewrite_status_message()
     assert(rewritten.find("\"ipcam\":{\"file\":{\"local\":\"local\"") != std::string::npos);
 }
 
+static void test_build_subtask_info()
+{
+    BambuPlugin::LocalPrintContextStore store;
+    store.update(make_context(), std::filesystem::temp_directory_path().string(), {});
+
+    std::string task_json;
+    std::string http_body;
+    unsigned int http_code = 0;
+    assert(store.build_subtask_info("subtask-1", &task_json, &http_code, &http_body));
+    assert(http_code == 200);
+    assert(http_body == "{}");
+    assert(task_json.find("\"thumbnail\":{\"url\":\"file:///tmp/thumb.png\"}") != std::string::npos);
+
+    task_json.clear();
+    http_body.clear();
+    http_code = 0;
+    assert(!store.build_subtask_info("missing", &task_json, &http_code, &http_body));
+    assert(http_code == 404);
+    assert(http_body == "{\"error\":\"not_found\"}");
+    assert(task_json.empty());
+}
+
 int main()
 {
     test_lookup_and_clear();
     test_rewrite_status_message();
+    test_build_subtask_info();
     std::cout << "local_print_context_test: ok\n";
     return 0;
 }

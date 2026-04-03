@@ -12,6 +12,18 @@ static void test_unsupported_cloud_json()
     assert(json.find("\"feature\":\"publish\"") != std::string::npos);
 }
 
+static void test_unsupported_helpers()
+{
+    unsigned int http_code = 0;
+    std::string body;
+    BambuPlugin::fill_unsupported_my_profile(&http_code, &body);
+    assert(http_code == 501);
+    assert(body.find("\"feature\":\"my_profile\"") != std::string::npos);
+
+    const std::string tasks = BambuPlugin::unsupported_user_tasks_json();
+    assert(tasks.find("\"unsupported\":true") != std::string::npos);
+}
+
 static void test_ensure_cloud_notice_file_writes_html()
 {
     const std::filesystem::path root = std::filesystem::temp_directory_path() / "bambu-farm-cloud-compat-test";
@@ -39,6 +51,7 @@ static void test_ensure_cloud_notice_file_writes_html()
 int main()
 {
     test_unsupported_cloud_json();
+    test_unsupported_helpers();
     test_ensure_cloud_notice_file_writes_html();
     std::cout << "cloud_compat_test: ok\n";
     return 0;

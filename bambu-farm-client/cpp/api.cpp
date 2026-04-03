@@ -893,12 +893,7 @@ int bambu_network_get_model_publish_url(void *agent_ptr, std::string *url)
 {
     LOG_CALL();
     if (url) {
-        *url = BambuPlugin::ensure_cloud_notice_file(
-            config_dir_path,
-            "publish.html",
-            "Model Publishing Not Supported",
-            "Publishing models from the OSS LAN plugin is currently out of scope."
-        );
+        *url = BambuPlugin::model_publish_notice_url(config_dir_path);
     }
     return 0;
 }
@@ -914,12 +909,7 @@ int bambu_network_get_model_mall_home_url(void *agent_ptr, std::string *url)
 {
     LOG_CALL();
     if (url) {
-        *url = BambuPlugin::ensure_cloud_notice_file(
-            config_dir_path,
-            "makerworld-home.html",
-            "MakerWorld Not Supported",
-            "MakerWorld browsing is currently disabled in the OSS LAN plugin."
-        );
+        *url = BambuPlugin::model_mall_home_notice_url(config_dir_path);
     }
     return 0;
 }
@@ -927,24 +917,14 @@ int bambu_network_get_model_mall_detail_url(void *agent_ptr, std::string *url, s
 {
     LOG_CALL();
     if (url) {
-        *url = BambuPlugin::ensure_cloud_notice_file(
-            config_dir_path,
-            "makerworld-model-" + BambuPlugin::sanitize_remote_filename(id) + ".html",
-            "MakerWorld Model Not Supported",
-            "MakerWorld model detail pages are currently disabled in the OSS LAN plugin."
-        );
+        *url = BambuPlugin::model_mall_detail_notice_url(config_dir_path, id);
     }
     return 0;
 }
 int bambu_network_get_my_profile(void *agent_ptr, std::string token, unsigned int *http_code, std::string *http_body)
 {
     LOG_CALL();
-    if (http_code) {
-        *http_code = 501;
-    }
-    if (http_body) {
-        *http_body = BambuPlugin::unsupported_cloud_json("my_profile");
-    }
+    BambuPlugin::fill_unsupported_my_profile(http_code, http_body);
     return 0;
 }
 int bambu_network_track_enable(void *agent_ptr, bool enable)
@@ -1045,38 +1025,10 @@ int bambu_network_get_subtask_info(void *agent_ptr, std::string subtask_id, std:
 {
     LOG_CALL();
     BambuPlugin::LocalPrintContext context;
-    if (!lookup_local_print_context_by_subtask_id(subtask_id, context)) {
+    if (!local_print_context_store.build_subtask_info(subtask_id, task_json, http_code, http_body) ||
+        !lookup_local_print_context_by_subtask_id(subtask_id, context)) {
         write_diag("bambu_network_get_subtask_info: not found subtask_id=" + subtask_id);
-        if (http_code) {
-            *http_code = 404;
-        }
-        if (http_body) {
-            *http_body = "{\"error\":\"not_found\"}";
-        }
-        if (task_json) {
-            task_json->clear();
-        }
         return -1;
-    }
-
-    if (http_code) {
-        *http_code = 200;
-    }
-    if (http_body) {
-        *http_body = "{}";
-    }
-    if (task_json) {
-        *task_json =
-            "{"
-            "\"content\":\"{\\\"info\\\":{\\\"plate_idx\\\":" + std::to_string(context.plate_index) + "}}\","
-            "\"context\":{"
-            "\"plates\":[{"
-            "\"index\":" + std::to_string(context.plate_index) + ","
-            "\"thumbnail\":{\"url\":\"" + BambuPlugin::json_escape(context.thumbnail_url) + "\"},"
-            "\"filaments\":[]"
-            "}]"
-            "}"
-            "}";
     }
 
     write_diag(
@@ -1097,13 +1049,7 @@ int bambu_network_get_user_tasks(void *agent_ptr, TaskQueryParams params, std::s
         " limit=" + std::to_string(params.limit)
     );
     if (http_body) {
-        *http_body =
-            "{"
-            "\"total\":0,"
-            "\"hits\":[],"
-            "\"unsupported\":true,"
-            "\"message\":\"Cloud print history is not supported by the OSS LAN plugin.\""
-            "}";
+        *http_body = BambuPlugin::unsupported_user_tasks_json();
     }
     return 0;
 }
