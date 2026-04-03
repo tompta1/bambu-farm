@@ -69,13 +69,15 @@ sudo apt-get install -y \
 
 The server reads `bambu-farm-server/bambufarm.toml` when you run it from the repo, and that file is intentionally ignored by git. Start from `bambu-farm-server/bambufarm_example.toml` and fill in your own printer details locally.
 
-`host`, `name`, `model`, and `password` are optional. `dev_id` is the only field that still needs to be configured.
+`host`, `name`, `model`, and `password` are optional. In the normal case, `dev_id` is the only field that still needs to be configured.
 
 If `host` is omitted, the server will try to discover the printer on local private IPv4 ranges using the configured `dev_id`. If `password` is present, it can also infer metadata over MQTT during discovery. If `host` is set but stops working, the server will also try to rediscover it on reconnect.
 
 If `name` or `model` are omitted, the server will try to infer them from the printer's MQTT `get_version` response and use that metadata in the device list.
 
 If `password` is omitted, Studio can still connect manually when it prompts for the LAN access code. The server will use that runtime password for the active session, but startup autoconnect will not work without a configured password.
+
+If `bambufarm.toml` does not define any printers, the server will also try to bootstrap printers from Bambu Studio's persisted `BambuStudio.conf`, using the `user_access_code` entries that Studio stores after a printer has already been paired once.
 
 ## Building the plugin
 

@@ -26,9 +26,11 @@ use tokio::time::sleep;
 use crate::bambu_farm::bambu_farm_server::BambuFarmServer;
 use std::collections::HashMap;
 use std::env::current_dir;
+use std::env::var_os;
+use std::fs;
 use std::io::{Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -322,6 +324,125 @@ pub struct Farm {
     printers: Arc<Mutex<Vec<Printer>>>,
     connections: Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<SendMessageRequest>>>>,
     upload_handler: UploadHandler,
+}
+
+fn bambu_studio_conf_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Some(xdg_config_home) = var_os("XDG_CONFIG_HOME") {
+        paths.push(PathBuf::from(&xdg_config_home).join("BambuStudio/BambuStudio.conf"));
+    }
+
+    if let Some(home) = var_os("HOME") {
+        let home = PathBuf::from(home);
+        paths.push(home.join(".var/app/com.bambulab.BambuStudio/config/BambuStudio/BambuStudio.conf"));
+        paths.push(home.join(".config/BambuStudio/BambuStudio.conf"));
+    }
+
+    paths
+}
+
+fn bambu_farm_config_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Some(xdg_config_home) = var_os("XDG_CONFIG_HOME") {
+        paths.push(PathBuf::from(&xdg_config_home).join("BambuStudio/bambufarm.toml"));
+    }
+
+    if let Some(home) = var_os("HOME") {
+        let home = PathBuf::from(home);
+        paths.push(home.join(".var/app/com.bambulab.BambuStudio/config/BambuStudio/bambufarm.toml"));
+        paths.push(home.join(".config/BambuStudio/bambufarm.toml"));
+    }
+
+    if let Ok(dir) = current_dir() {
+        paths.push(dir.join("bambufarm.toml"));
+    }
+
+    paths
+}
+
+fn load_persisted_studio_printers() -> Vec<Printer> {
+    let Some(path) = bambu_studio_conf_candidates()
+        .into_iter()
+        .find(|candidate| candidate.exists())
+    else {
+        return Vec::new();
+    };
+
+    let data = match fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(err) => {
+            warn!("failed to read persisted Studio config at {}: {}", path.display(), err);
+            return Vec::new();
+        }
+    };
+
+    let root: JsonValue = match serde_json::from_str(&data) {
+        Ok(root) => root,
+        Err(err) => {
+            warn!("failed to parse persisted Studio config at {}: {}", path.display(), err);
+            return Vec::new();
+        }
+    };
+
+    let access_codes = root
+        .get("user_access_code")
+        .and_then(JsonValue::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut printers = Vec::new();
+    for (dev_id, password) in access_codes {
+        if dev_id.trim().is_empty() {
+            continue;
+        }
+        let Some(password) = password.as_str().map(str::trim).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+
+        printers.push(Printer {
+            name: String::new(),
+            id: dev_id,
+            ip: String::new(),
+            model: String::new(),
+            password: password.to_string(),
+        });
+    }
+
+    printers
+}
+
+fn merge_printers(configured: Vec<Printer>, persisted: Vec<Printer>) -> Vec<Printer> {
+    let mut merged: HashMap<String, Printer> = HashMap::new();
+
+    for printer in persisted {
+        merged.insert(printer.id.clone(), printer);
+    }
+
+    for printer in configured {
+        merged
+            .entry(printer.id.clone())
+            .and_modify(|existing| {
+                if existing.name.trim().is_empty() && !printer.name.trim().is_empty() {
+                    existing.name = printer.name.clone();
+                }
+                if existing.ip.trim().is_empty() && !printer.ip.trim().is_empty() {
+                    existing.ip = printer.ip.clone();
+                }
+                if existing.model.trim().is_empty() && !printer.model.trim().is_empty() {
+                    existing.model = printer.model.clone();
+                }
+                if existing.password.trim().is_empty() && !printer.password.trim().is_empty() {
+                    existing.password = printer.password.clone();
+                }
+            })
+            .or_insert(printer);
+    }
+
+    let mut printers: Vec<_> = merged.into_values().collect();
+    printers.sort_by(|left, right| left.id.cmp(&right.id));
+    printers
 }
 
 fn ftps_connector() -> Result<NativeTlsConnector, String> {
@@ -1105,11 +1226,10 @@ fn construct_printer(config: Value) -> Option<Printer> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let config_file_path = if let Ok(dir) = current_dir() {
-        dir.join("bambufarm.toml")
-    } else {
-        "bambufarm.toml".into()
-    };
+    let config_file_path = bambu_farm_config_candidates()
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from("bambufarm.toml"));
 
     let config = match Config::builder()
         .add_source(config::File::with_name(&config_file_path.to_string_lossy()).required(false))
@@ -1144,11 +1264,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or("[::1]:47403".into());
     let addr = addr.parse().unwrap();
 
+    let configured_printers: Vec<Printer> = config
+        .get_array("printers")
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(construct_printer)
+        .collect();
+    let persisted_printers = load_persisted_studio_printers();
+    let merged_printers = merge_printers(configured_printers, persisted_printers);
+
     let farm = Farm::default();
-    for printer in config.get_array("printers").unwrap_or_default() {
-        if let Some(printer) = construct_printer(printer) {
-            farm.printers.lock().unwrap().push(printer);
-        }
+    for printer in merged_printers {
+        farm.printers.lock().unwrap().push(printer);
     }
     if farm.printers.lock().unwrap().is_empty() {
         error!(
@@ -1290,6 +1417,50 @@ mod tests {
                     .output();
             }
         }
+    }
+
+    #[test]
+    fn merge_printers_prefers_config_metadata_and_persisted_password() {
+        let merged = merge_printers(
+            vec![Printer {
+                name: "Configured Name".to_string(),
+                id: "TESTDEVICE123456".to_string(),
+                ip: "192.0.2.10".to_string(),
+                model: "N1".to_string(),
+                password: String::new(),
+            }],
+            vec![Printer {
+                name: String::new(),
+                id: "TESTDEVICE123456".to_string(),
+                ip: String::new(),
+                model: String::new(),
+                password: "persisted-secret".to_string(),
+            }],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "Configured Name");
+        assert_eq!(merged[0].ip, "192.0.2.10");
+        assert_eq!(merged[0].model, "N1");
+        assert_eq!(merged[0].password, "persisted-secret");
+    }
+
+    #[test]
+    fn merge_printers_uses_persisted_entries_when_config_missing() {
+        let merged = merge_printers(
+            Vec::new(),
+            vec![Printer {
+                name: String::new(),
+                id: "TESTDEVICE123456".to_string(),
+                ip: String::new(),
+                model: String::new(),
+                password: "persisted-secret".to_string(),
+            }],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "TESTDEVICE123456");
+        assert_eq!(merged[0].password, "persisted-secret");
     }
 
     #[test]
