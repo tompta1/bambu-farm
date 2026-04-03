@@ -1,5 +1,8 @@
 endpoint = "127.0.0.1:47403"
 
 printers = [
-    { "name" = "Example X1C", model = "X1C", "host" = "my_printer_ip_address", "dev_id" = "01234567", "password" = "abcdefgh" }
+    # `host`, `name`, and `model` are optional. If omitted, the server will
+    # scan local private IPv4 ranges and try to rediscover the printer by
+    # `dev_id` over MQTT, then infer display metadata from the probe response.
+    { "dev_id" = "01234567", "password" = "abcdefgh" }
 ]

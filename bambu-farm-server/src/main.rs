@@ -5,9 +5,12 @@ use bambu_farm::{
     UploadFileChunk, UploadFileRequest, UploadFileResponse,
 };
 use config::{Config, ConfigError, Value};
+use if_addrs::{IfAddr, get_if_addrs};
+use futures::stream;
+use futures::StreamExt;
 use log::{error, info, warn};
 use paho_mqtt::{
-    AsyncClient, ConnectOptionsBuilder, CreateOptionsBuilder, Message, SslOptionsBuilder,
+    AsyncClient, Client, ConnectOptionsBuilder, CreateOptionsBuilder, Message, SslOptionsBuilder,
 };
 use serde_json::{json, Value as JsonValue};
 use std::convert::TryFrom;
@@ -24,6 +27,7 @@ use crate::bambu_farm::bambu_farm_server::BambuFarmServer;
 use std::collections::HashMap;
 use std::env::current_dir;
 use std::io::{Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -43,6 +47,238 @@ const CONTROL_CMD_REQUEST_MEDIA_ABILITY: i64 = 0x0007;
 const MQTT_MIN_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MQTT_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const MQTT_KEEP_ALIVE: Duration = Duration::from_secs(20);
+const DISCOVERY_TCP_TIMEOUT: Duration = Duration::from_millis(150);
+const DISCOVERY_MQTT_TIMEOUT: Duration = Duration::from_secs(2);
+const DISCOVERY_PROBE_SLEEP: Duration = Duration::from_millis(200);
+const DISCOVERY_SCAN_CONCURRENCY: usize = 64;
+
+#[derive(Debug, Clone)]
+struct DiscoveryMatch {
+    ip: Ipv4Addr,
+    name: Option<String>,
+    model: Option<String>,
+}
+
+fn local_ipv4_candidates() -> Vec<Ipv4Addr> {
+    let mut candidates = Vec::new();
+
+    let interfaces = match get_if_addrs() {
+        Ok(interfaces) => interfaces,
+        Err(err) => {
+            warn!("failed to enumerate local interfaces for discovery: {}", err);
+            return candidates;
+        }
+    };
+
+    for iface in interfaces {
+        let IfAddr::V4(v4) = iface.addr else {
+            continue;
+        };
+        let ip = v4.ip;
+        if ip.is_loopback() || !ip.is_private() {
+            continue;
+        }
+
+        let ip_u32 = u32::from(ip);
+        let netmask_u32 = u32::from(v4.netmask);
+        let prefix_len = netmask_u32.count_ones();
+        let effective_mask = if prefix_len < 24 {
+            0xFFFF_FF00
+        } else {
+            netmask_u32
+        };
+        let network = ip_u32 & effective_mask;
+        let broadcast = network | !effective_mask;
+        if broadcast <= network + 1 {
+            continue;
+        }
+
+        for host in (network + 1)..broadcast {
+            let candidate = Ipv4Addr::from(host);
+            if candidate != ip {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
+async fn mqtt_reachable_hosts() -> Vec<Ipv4Addr> {
+    stream::iter(local_ipv4_candidates())
+        .map(|ip| async move {
+            let addr = SocketAddr::new(IpAddr::V4(ip), 8883);
+            match tokio::time::timeout(DISCOVERY_TCP_TIMEOUT, tokio::net::TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => {
+                    drop(stream);
+                    Some(ip)
+                }
+                _ => None,
+            }
+        })
+        .buffer_unordered(DISCOVERY_SCAN_CONCURRENCY)
+        .filter_map(|ip| async move { ip })
+        .collect()
+        .await
+}
+
+fn model_code_from_product_name(product_name: &str) -> Option<&'static str> {
+    let product_name = product_name.trim().to_ascii_lowercase();
+    if product_name.contains("x1 carbon") || product_name.contains("x1c") {
+        Some("3DPrinter-X1-Carbon")
+    } else if product_name.contains("x1") {
+        Some("3DPrinter-X1")
+    } else if product_name.contains("p1s") {
+        Some("C12")
+    } else if product_name.contains("p1p") {
+        Some("C11")
+    } else if product_name.contains("a1 mini") || product_name.contains("a1mini") {
+        Some("N1")
+    } else if product_name.contains("a1") {
+        Some("N2S")
+    } else {
+        None
+    }
+}
+
+fn discovery_match_from_payload(candidate_ip: Ipv4Addr, payload: &str) -> DiscoveryMatch {
+    let root: JsonValue = serde_json::from_str(payload).unwrap_or(JsonValue::Null);
+    let modules = root
+        .get("info")
+        .and_then(|info| info.get("module"))
+        .and_then(JsonValue::as_array);
+    let product_name = modules
+        .and_then(|modules| {
+            modules
+                .iter()
+                .find(|module| {
+                    module
+                        .get("visible")
+                        .and_then(JsonValue::as_bool)
+                        .unwrap_or(false)
+                        && module
+                            .get("product_name")
+                            .and_then(JsonValue::as_str)
+                            .map(|name| !name.trim().is_empty())
+                            .unwrap_or(false)
+                })
+                .or_else(|| {
+                    modules.iter().find(|module| {
+                        module
+                            .get("product_name")
+                            .and_then(JsonValue::as_str)
+                            .map(|name| !name.trim().is_empty())
+                            .unwrap_or(false)
+                    })
+                })
+        })
+        .and_then(|module| module.get("product_name"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+
+    DiscoveryMatch {
+        ip: candidate_ip,
+        model: product_name
+            .as_deref()
+            .and_then(model_code_from_product_name)
+            .map(str::to_string),
+        name: product_name,
+    }
+}
+
+fn probe_printer_identity(printer: &Printer, candidate_ip: Ipv4Addr) -> Option<DiscoveryMatch> {
+    let server_uri = format!("mqtts://{}:8883", candidate_ip);
+    let client_id = format!("bambu-farm-discovery-{}-{}", printer.id, candidate_ip);
+    let cli = match Client::new(
+        CreateOptionsBuilder::new()
+            .server_uri(server_uri)
+            .client_id(client_id)
+            .finalize(),
+    ) {
+        Ok(cli) => cli,
+        Err(err) => {
+            warn!("discovery probe client create failed for {}: {}", candidate_ip, err);
+            return None;
+        }
+    };
+
+    let rx = cli.start_consuming();
+    let connect_opts = ConnectOptionsBuilder::new()
+        .user_name("bblp")
+        .password(&printer.password)
+        .keep_alive_interval(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(2))
+        .clean_session(true)
+        .ssl_options(
+            SslOptionsBuilder::new()
+                .verify(false)
+                .enable_server_cert_auth(false)
+                .finalize(),
+        )
+        .finalize();
+
+    if let Err(err) = cli.connect(Some(connect_opts)) {
+        warn!(
+            "discovery probe connect failed for printer={} candidate_ip={}: {}",
+            printer.id, candidate_ip, err
+        );
+        return None;
+    }
+
+    let report_topic = format!("device/{}/report", printer.id);
+    let request_topic = format!("device/{}/request", printer.id);
+    let subscribe_ok = cli.subscribe(&report_topic, 0).is_ok();
+    let publish_ok = subscribe_ok
+        && cli
+            .publish(Message::new(
+                &request_topic,
+                json!({"info":{"command":"get_version","sequence_id":"discovery"}}).to_string(),
+                0,
+            ))
+            .is_ok();
+
+    let mut matched = None;
+    if publish_ok {
+        let deadline = std::time::Instant::now() + DISCOVERY_MQTT_TIMEOUT;
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(message)) = rx.recv_timeout(DISCOVERY_PROBE_SLEEP) {
+                if message.topic() == report_topic {
+                    matched = Some(discovery_match_from_payload(
+                        candidate_ip,
+                        &message.payload_str(),
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = cli.disconnect(None);
+    cli.stop_consuming();
+    matched
+}
+
+async fn discover_printer(printer: &Printer) -> Option<DiscoveryMatch> {
+    let candidates = mqtt_reachable_hosts().await;
+    info!(
+        "discovery scanning {} MQTT-reachable hosts for printer={}",
+        candidates.len(),
+        printer.id
+    );
+
+    for candidate in candidates {
+        if let Some(discovered) = probe_printer_identity(printer, candidate) {
+            info!("discovery matched printer={} at {}", printer.id, candidate);
+            return Some(discovered);
+        }
+    }
+
+    None
+}
 
 fn remote_media_dir(requested_type: &str) -> Option<&'static str> {
     match requested_type {
@@ -77,6 +313,7 @@ struct Printer {
     password: String,
 }
 
+#[derive(Clone)]
 pub struct Farm {
     printers: Arc<Mutex<Vec<Printer>>>,
     connections: Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<SendMessageRequest>>>>,
@@ -396,6 +633,183 @@ impl Farm {
             })
     }
 
+    fn update_printer_discovery(&self, dev_id: &str, discovered: &DiscoveryMatch) {
+        if let Ok(mut printers) = self.printers.lock() {
+            if let Some(printer) = printers.iter_mut().find(|printer| printer.id == dev_id) {
+                printer.ip = discovered.ip.to_string();
+                if printer.name.trim().is_empty() {
+                    if let Some(name) = discovered.name.as_deref().map(str::trim).filter(|name| !name.is_empty()) {
+                        printer.name = name.to_string();
+                    }
+                }
+                if printer.model.trim().is_empty() {
+                    if let Some(model) = discovered.model.as_deref().map(str::trim).filter(|model| !model.is_empty()) {
+                        printer.model = model.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    async fn refresh_discovery_metadata(&self) {
+        let printers = match self.printers.lock() {
+            Ok(printers) => printers.clone(),
+            Err(_) => return,
+        };
+
+        for printer in printers {
+            if !printer.ip.trim().is_empty() && !printer.name.trim().is_empty() && !printer.model.trim().is_empty() {
+                continue;
+            }
+
+            if let Some(discovered) = discover_printer(&printer).await {
+                self.update_printer_discovery(&printer.id, &discovered);
+            }
+        }
+    }
+
+    async fn resolve_printer_for_connect(&self, printer: Printer) -> Result<Printer, Status> {
+        if !printer.ip.trim().is_empty() {
+            return Ok(printer);
+        }
+
+        let Some(discovered) = discover_printer(&printer).await else {
+            return Err(Status::unavailable("Could not discover printer host"));
+        };
+
+        self.update_printer_discovery(&printer.id, &discovered);
+        let mut resolved = printer;
+        resolved.ip = discovered.ip.to_string();
+        if resolved.name.trim().is_empty() {
+            resolved.name = discovered
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Bambu {}", resolved.id));
+        }
+        if resolved.model.trim().is_empty() {
+            resolved.model = discovered.model.clone().unwrap_or_default();
+        }
+        Ok(resolved)
+    }
+
+    async fn connect_printer_session(
+        &self,
+        printer: &Printer,
+        request: &Request<ConnectRequest>,
+    ) -> Result<Response<ReceiverStream<Result<RecvMessage, Status>>>, Status> {
+        let (response_tx, response_rx) = mpsc::channel(4);
+        let dev_id = printer.id.clone();
+        let options =
+            CreateOptionsBuilder::new().server_uri(format!("mqtts://{}:8883", printer.ip));
+        let mut client = match AsyncClient::new(options.finalize()) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to create MQTT client for {}: {}", dev_id, e);
+                return Err(Status::internal("Failed to create MQTT client"));
+            }
+        };
+
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(10);
+        let report_topic = format!("device/{}/report", request.get_ref().dev_id);
+        let request_topic = format!("device/{}/request", request.get_ref().dev_id);
+        let callback_dev_id = dev_id.clone();
+        let callback_report_topic = report_topic.clone();
+        client.set_connected_callback(move |cli| {
+            info!("MQTT connected for {}", callback_dev_id);
+            let _ = cli.subscribe(&callback_report_topic, 0);
+        });
+        let lost_dev_id = dev_id.clone();
+        client.set_connection_lost_callback(move |_| {
+            warn!("MQTT connection lost for {}", lost_dev_id);
+        });
+
+        let connection_token = client.connect(Some(
+            ConnectOptionsBuilder::new()
+                .user_name("bblp")
+                .password(&printer.password)
+                .keep_alive_interval(MQTT_KEEP_ALIVE)
+                .clean_session(false)
+                .automatic_reconnect(MQTT_MIN_RECONNECT_DELAY, MQTT_MAX_RECONNECT_DELAY)
+                .ssl_options(
+                    SslOptionsBuilder::new()
+                        .verify(false)
+                        .enable_server_cert_auth(false)
+                        .finalize(),
+                )
+                .finalize(),
+        ));
+        if let Err(e) = connection_token.await {
+            error!("MQTT connect failed for {} at {}: {}", dev_id, printer.ip, e);
+            return Err(Status::unavailable("Could not connect to printer"));
+        }
+
+        if let Err(e) = client.subscribe(&report_topic, 0).await {
+            error!("MQTT subscribe failed for {}: {}", dev_id, e);
+            return Err(Status::internal("Failed to subscribe to printer topic"));
+        }
+
+        let stream = client.get_stream(100);
+
+        let connections = self.connections.clone();
+        let stream_dev_id = dev_id.clone();
+        spawn(async move {
+            loop {
+                match stream.recv().await {
+                    Ok(Some(message)) => {
+                        let send_result = response_tx
+                            .send(Ok(RecvMessage {
+                                connected: true,
+                                dev_id: stream_dev_id.clone(),
+                                data: message.payload_str().to_string(),
+                            }))
+                            .await;
+                        if send_result.is_err() {
+                            info!("gRPC stream closed for {}", stream_dev_id);
+                            break;
+                        }
+                    }
+                    _ => {
+                        warn!("MQTT stream ended for {}; waiting for auto-reconnect", stream_dev_id);
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                }
+            }
+            connections.lock().unwrap().remove(&stream_dev_id);
+        });
+
+        self.connections
+            .lock()
+            .unwrap()
+            .insert(request.get_ref().dev_id.clone(), message_tx);
+
+        let publish_dev_id = request.get_ref().dev_id.clone();
+        spawn(async move {
+            loop {
+                let recv_message = match message_rx.recv().await {
+                    Some(m) => m,
+                    None => {
+                        info!("Send channel closed for {}", publish_dev_id);
+                        break;
+                    }
+                };
+                info!("Publishing to device/{}/request", publish_dev_id);
+                if let Err(e) = client
+                    .publish(Message::new(
+                        request_topic.clone(),
+                        recv_message.data,
+                        0,
+                    ))
+                    .await
+                {
+                    warn!("MQTT publish failed for {}: {}", publish_dev_id, e);
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(response_rx)))
+    }
+
     async fn upload_temp_file(
         &self,
         printer: Printer,
@@ -426,10 +840,11 @@ impl BambuFarm for Farm {
     ) -> Result<Response<Self::GetAvailablePrintersStream>, Status> {
         let (tx, rx) = mpsc::channel(4);
 
-        let printers = self.printers.clone();
+        let farm = self.clone();
         tokio::spawn(async move {
+            farm.refresh_discovery_metadata().await;
             loop {
-                let printers = match printers.lock() {
+                let printers = match farm.printers.lock() {
                     Ok(printers) => printers.clone(),
                     Err(_) => return,
                 };
@@ -437,9 +852,17 @@ impl BambuFarm for Farm {
                     options: printers
                         .iter()
                         .map(|printer| PrinterOption {
-                            dev_name: printer.name.clone(),
+                            dev_name: if printer.name.trim().is_empty() {
+                                format!("Bambu {}", printer.id)
+                            } else {
+                                printer.name.clone()
+                            },
                             dev_id: printer.id.clone(),
-                            model: printer.model.clone(),
+                            model: if printer.model.trim().is_empty() {
+                                "unknown".to_string()
+                            } else {
+                                printer.model.clone()
+                            },
                         })
                         .collect(),
                 };
@@ -459,129 +882,39 @@ impl BambuFarm for Farm {
         &self,
         request: Request<ConnectRequest>,
     ) -> Result<Response<Self::ConnectPrinterStream>, Status> {
-        let (response_tx, response_rx) = mpsc::channel(4);
+        let printer = self.lookup_printer(&request.get_ref().dev_id)?;
+        let printer = self.resolve_printer_for_connect(printer).await?;
 
-        let printers = match self.printers.lock() {
-            Ok(printers) => printers.clone(),
-            Err(_) => return Err(Status::unknown("Could not lock printer list.")),
-        };
-        let printer = printers
-            .iter()
-            .filter(|printer| printer.id == request.get_ref().dev_id)
-            .next();
-        if let Some(printer) = printer {
-            let dev_id = printer.id.clone();
-            let options =
-                CreateOptionsBuilder::new().server_uri(format!("mqtts://{}:8883", printer.ip));
-            let mut client = match AsyncClient::new(options.finalize()) {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("Failed to create MQTT client for {}: {}", dev_id, e);
-                    return Err(Status::internal("Failed to create MQTT client"));
+        match self.connect_printer_session(&printer, &request).await {
+            Ok(response) => Ok(response),
+            Err(connect_err) => {
+                warn!(
+                    "connect_printer: initial connect failed for printer={} host={} error={}; attempting host rediscovery",
+                    printer.id, printer.ip, connect_err
+                );
+                let Some(discovered) = discover_printer(&printer).await else {
+                    return Err(connect_err);
+                };
+                if discovered.ip.to_string() == printer.ip {
+                    return Err(connect_err);
                 }
-            };
 
-            let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(10);
-            let report_topic = format!("device/{}/report", request.get_ref().dev_id);
-            let request_topic = format!("device/{}/request", request.get_ref().dev_id);
-            let callback_dev_id = dev_id.clone();
-            let callback_report_topic = report_topic.clone();
-            client.set_connected_callback(move |cli| {
-                info!("MQTT connected for {}", callback_dev_id);
-                let _ = cli.subscribe(&callback_report_topic, 0);
-            });
-            let lost_dev_id = dev_id.clone();
-            client.set_connection_lost_callback(move |_| {
-                warn!("MQTT connection lost for {}", lost_dev_id);
-            });
-
-            let connection_token = client.connect(Some(
-                ConnectOptionsBuilder::new()
-                    .user_name("bblp")
-                    .password(&printer.password)
-                    .keep_alive_interval(MQTT_KEEP_ALIVE)
-                    .clean_session(false)
-                    .automatic_reconnect(MQTT_MIN_RECONNECT_DELAY, MQTT_MAX_RECONNECT_DELAY)
-                    .ssl_options(
-                        SslOptionsBuilder::new()
-                            .verify(false)
-                            .enable_server_cert_auth(false)
-                            .finalize(),
-                    )
-                    .finalize(),
-            ));
-            if let Err(e) = connection_token.await {
-                error!("MQTT connect failed for {} at {}: {}", dev_id, printer.ip, e);
-                return Err(Status::unavailable("Could not connect to printer"));
-            }
-
-            if let Err(e) = client.subscribe(&report_topic, 0).await {
-                error!("MQTT subscribe failed for {}: {}", dev_id, e);
-                return Err(Status::internal("Failed to subscribe to printer topic"));
-            }
-
-            let stream = client.get_stream(100);
-
-            let connections = self.connections.clone();
-            spawn(async move {
-                loop {
-                    match stream.recv().await {
-                        Ok(Some(message)) => {
-                            let send_result = response_tx
-                                .send(Ok(RecvMessage {
-                                    connected: true,
-                                    dev_id: dev_id.clone(),
-                                    data: message.payload_str().to_string(),
-                                }))
-                                .await;
-                            if send_result.is_err() {
-                                info!("gRPC stream closed for {}", dev_id);
-                                break;
-                            }
-                        }
-                        _ => {
-                            warn!("MQTT stream ended for {}; waiting for auto-reconnect", dev_id);
-                            sleep(Duration::from_secs(1)).await;
-                            continue;
-                        }
+                self.update_printer_discovery(&printer.id, &discovered);
+                let mut rediscovered = printer;
+                rediscovered.ip = discovered.ip.to_string();
+                if rediscovered.name.trim().is_empty() {
+                    if let Some(name) = discovered.name {
+                        rediscovered.name = name;
                     }
                 }
-                connections.lock().unwrap().remove(&dev_id);
-            });
-
-            self.connections
-                .lock()
-                .unwrap()
-                .insert(request.get_ref().dev_id.clone(), message_tx);
-
-            let publish_dev_id = request.get_ref().dev_id.clone();
-            spawn(async move {
-                loop {
-                    let recv_message = match message_rx.recv().await {
-                        Some(m) => m,
-                        None => {
-                            info!("Send channel closed for {}", publish_dev_id);
-                            break;
-                        }
-                    };
-                    info!("Publishing to device/{}/request", publish_dev_id);
-                    if let Err(e) = client
-                        .publish(Message::new(
-                            request_topic.clone(),
-                            recv_message.data,
-                            0,
-                        ))
-                        .await
-                    {
-                        warn!("MQTT publish failed for {}: {}", publish_dev_id, e);
+                if rediscovered.model.trim().is_empty() {
+                    if let Some(model) = discovered.model {
+                        rediscovered.model = model;
                     }
                 }
-            });
-        } else {
-            return Err(Status::unknown("No matching printer."));
+                self.connect_printer_session(&rediscovered, &request).await
+            }
         }
-
-        Ok(Response::new(ReceiverStream::new(response_rx)))
     }
 
     async fn send_message(
@@ -706,31 +1039,23 @@ fn construct_printer(config: Value) -> Option<Printer> {
             }
         }
     } else {
-        eprintln!("Missing `model` in printer config.");
-        return None;
+        ""
     };
-    let host = if let Some(host) = printer.get("host") {
-        host
-    } else {
-        eprintln!("Missing `host` in printer config.");
-        return None;
-    };
+    let host = printer
+        .get("host")
+        .map(|host| host.to_string())
+        .unwrap_or_default();
     let password = if let Some(password) = printer.get("password") {
         password
     } else {
         eprintln!("Missing `password` in printer config.");
         return None;
     };
-    let name = if let Some(name) = printer.get("name") {
-        name
-    } else {
-        eprintln!("Missing `name` in printer config.");
-        return None;
-    };
+    let name = printer.get("name").map(ToString::to_string).unwrap_or_default();
     Some(Printer {
-        name: name.to_string(),
+        name,
         id: dev_id.to_string(),
-        ip: host.to_string(),
+        ip: host,
         model: model.to_string(),
         password: password.to_string(),
     })
@@ -810,6 +1135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use config::Map;
     use std::net::{SocketAddr, TcpListener};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::oneshot;
@@ -885,6 +1211,16 @@ mod tests {
         format!("codex-integration-{}.txt", millis)
     }
 
+    fn test_printer_config(host: Option<&str>) -> Value {
+        let mut printer = Map::new();
+        printer.insert("dev_id".to_string(), Value::from("TESTDEVICE123456"));
+        printer.insert("password".to_string(), Value::from("secret"));
+        if let Some(host) = host {
+            printer.insert("host".to_string(), Value::from(host));
+        }
+        Value::from(printer)
+    }
+
     fn delete_remote_path_best_effort(printer: &Printer, remote_path: &str) {
         match connect_rust_ftps(printer) {
             Ok(mut ftp_stream) => {
@@ -914,6 +1250,54 @@ mod tests {
                     .output();
             }
         }
+    }
+
+    #[test]
+    fn construct_printer_allows_missing_host() {
+        let printer = construct_printer(test_printer_config(None)).expect("printer config");
+
+        assert_eq!(printer.name, "");
+        assert_eq!(printer.id, "TESTDEVICE123456");
+        assert_eq!(printer.model, "");
+        assert_eq!(printer.password, "secret");
+        assert!(printer.ip.is_empty());
+    }
+
+    #[test]
+    fn construct_printer_preserves_explicit_host() {
+        let printer =
+            construct_printer(test_printer_config(Some("192.0.2.10"))).expect("printer config");
+
+        assert_eq!(printer.ip, "192.0.2.10");
+    }
+
+    #[test]
+    fn construct_printer_maps_explicit_model() {
+        let mut config = test_printer_config(None).into_table().expect("printer table");
+        config.insert("model".to_string(), Value::from("a1mini"));
+
+        let printer = construct_printer(Value::from(config)).expect("printer config");
+
+        assert_eq!(printer.model, "N1");
+    }
+
+    #[test]
+    fn discovery_match_parses_product_name_and_model() {
+        let matched = discovery_match_from_payload(
+            Ipv4Addr::new(192, 168, 1, 247),
+            r#"{
+                "info": {
+                    "module": [
+                        {"visible": false, "product_name": ""},
+                        {"visible": true, "product_name": "Bambu Lab A1 mini"}
+                    ]
+                }
+            }"#,
+        );
+
+        assert_eq!(matched.ip, Ipv4Addr::new(192, 168, 1, 247));
+        assert_eq!(matched.name.as_deref(), Some("Bambu Lab A1 mini"));
+        assert_eq!(matched.model.as_deref(), Some("N1"));
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@ Current `main` is focused on Linux `aarch64` / ARM64 usage, especially Flatpak B
 What currently works in LAN mode:
 
 - printer discovery and connect/disconnect
+- printer host autodiscovery when `host` is omitted or stale in config
 - printer status monitoring and live state updates
 - local print submission, including larger streamed `.3mf` uploads
 - AMS mapping forwarding for print jobs
@@ -67,6 +68,12 @@ sudo apt-get install -y \
 ## Local configuration
 
 The server reads `bambu-farm-server/bambufarm.toml` when you run it from the repo, and that file is intentionally ignored by git. Start from `bambu-farm-server/bambufarm_example.toml` and fill in your own printer details locally.
+
+`host`, `name`, and `model` are optional. The only fields that still need to be configured are `dev_id` and `password`.
+
+If `host` is omitted, the server will try to discover the printer on local private IPv4 ranges using the configured `dev_id` and `password`. If `host` is set but stops working, the server will also try to rediscover it on reconnect.
+
+If `name` or `model` are omitted, the server will try to infer them from the printer's MQTT `get_version` response and use that metadata in the device list.
 
 ## Building the plugin
 
