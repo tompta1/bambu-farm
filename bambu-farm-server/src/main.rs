@@ -888,7 +888,7 @@ impl Farm {
         let dev_id = printer.id.clone();
         let options =
             CreateOptionsBuilder::new().server_uri(format!("mqtts://{}:8883", printer.ip));
-        let mut client = match AsyncClient::new(options.finalize()) {
+        let client = match AsyncClient::new(options.finalize()) {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to create MQTT client for {}: {}", dev_id, e);
@@ -897,6 +897,7 @@ impl Farm {
         };
 
         let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(10);
+        let (recv_tx, mut recv_rx) = tokio::sync::mpsc::unbounded_channel::<RecvMessage>();
         let report_topic = format!("device/{}/report", request.get_ref().dev_id);
         let request_topic = format!("device/{}/request", request.get_ref().dev_id);
         let callback_dev_id = dev_id.clone();
@@ -908,6 +909,17 @@ impl Farm {
         let lost_dev_id = dev_id.clone();
         client.set_connection_lost_callback(move |_| {
             warn!("MQTT connection lost for {}", lost_dev_id);
+        });
+        let recv_dev_id = dev_id.clone();
+        client.set_message_callback(move |_cli, message| {
+            let Some(message) = message else {
+                return;
+            };
+            let _ = recv_tx.send(RecvMessage {
+                connected: true,
+                dev_id: recv_dev_id.clone(),
+                data: message.payload_str().to_string(),
+            });
         });
 
         let connection_token = client.connect(Some(
@@ -935,34 +947,34 @@ impl Farm {
             return Err(Status::internal("Failed to subscribe to printer topic"));
         }
 
-        let stream = client.get_stream(100);
-
         let connections = self.connections.clone();
         let stream_dev_id = dev_id.clone();
+        let response_closed = response_tx.clone();
+        let cleanup_client = client.clone();
         spawn(async move {
             loop {
-                match stream.recv().await {
-                    Ok(Some(message)) => {
+                tokio::select! {
+                    _ = response_closed.closed() => {
+                        info!("gRPC stream closed for {}", stream_dev_id);
+                        break;
+                    }
+                    maybe_message = recv_rx.recv() => {
+                        let Some(message) = maybe_message else {
+                            warn!("MQTT receive callback channel closed for {}", stream_dev_id);
+                            break;
+                        };
                         let send_result = response_tx
-                            .send(Ok(RecvMessage {
-                                connected: true,
-                                dev_id: stream_dev_id.clone(),
-                                data: message.payload_str().to_string(),
-                            }))
+                            .send(Ok(message))
                             .await;
                         if send_result.is_err() {
                             info!("gRPC stream closed for {}", stream_dev_id);
                             break;
                         }
                     }
-                    _ => {
-                        warn!("MQTT stream ended for {}; waiting for auto-reconnect", stream_dev_id);
-                        sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
                 }
             }
             connections.lock().unwrap().remove(&stream_dev_id);
+            let _ = cleanup_client.disconnect(None).await;
         });
 
         self.connections
