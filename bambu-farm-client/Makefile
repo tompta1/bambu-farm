@@ -13,6 +13,7 @@ LOCAL_STATE_TEST_BIN ?= target/debug/local_state_test
 SESSION_STATE_TEST_BIN ?= target/debug/session_state_test
 CALLBACK_REGISTRY_TEST_BIN ?= target/debug/callback_registry_test
 LOCAL_PRINT_CONTEXT_TEST_BIN ?= target/debug/local_print_context_test
+PRINTER_METADATA_TEST_BIN ?= target/debug/printer_metadata_test
 
 shared:
 	cargo build
@@ -69,5 +70,9 @@ test-helpers:
 		cpp/print_job.cpp cpp/local_state.cpp cpp/local_print_context.cpp cpp/local_print_context_test.cpp \
 		-o "$(LOCAL_PRINT_CONTEXT_TEST_BIN)"
 	"$(LOCAL_PRINT_CONTEXT_TEST_BIN)"
+	g++ -std=c++17 -Wall -Wextra -pedantic -Icpp \
+		cpp/print_job.cpp cpp/local_state.cpp cpp/printer_metadata.cpp cpp/printer_metadata_test.cpp \
+		-o "$(PRINTER_METADATA_TEST_BIN)"
+	"$(PRINTER_METADATA_TEST_BIN)"
 
 test: test-helpers

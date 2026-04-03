@@ -22,6 +22,7 @@ fn main() {
         .file("cpp/cloud_compat.cpp")
         .file("cpp/local_print_context.cpp")
         .file("cpp/local_state.cpp")
+        .file("cpp/printer_metadata.cpp")
         .file("cpp/print_job.cpp")
         .file("cpp/session_state.cpp")
         .include("cpp")

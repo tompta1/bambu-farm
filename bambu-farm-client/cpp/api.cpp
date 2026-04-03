@@ -3,6 +3,7 @@
 #include "cloud_compat.hpp"
 #include "local_print_context.hpp"
 #include "local_state.hpp"
+#include "printer_metadata.hpp"
 #include "print_job.hpp"
 #include "session_state.hpp"
 #include "stdio.h"
@@ -43,14 +44,13 @@ static size_t user_login_log_counter = 0;
 static size_t build_login_cmd_log_counter = 0;
 static const char *kLanBackendUrl = "http://127.0.0.1:47403";
 static std::atomic<bool> lan_user_logged_in{true};
-static std::mutex printer_name_overrides_mutex;
-static std::unordered_map<std::string, std::string> printer_name_overrides;
 static std::string last_tunnel_error;
 static std::string preview_payload(const std::string &message, size_t limit = 1024);
 static constexpr size_t kTunnelDownloadChunkSize = 4 * 1024 * 1024;
 static std::atomic<std::uint64_t> next_video_stream_id{1};
 static BambuPlugin::SessionState session_state;
 static BambuPlugin::CallbackRegistry callback_registry;
+static BambuPlugin::PrinterMetadataStore printer_metadata_store;
 
 struct CompatTunnel
 {
@@ -222,42 +222,6 @@ static std::string synthetic_local_id(const char *prefix, const std::string &dev
     return std::string(prefix) + "-" + std::to_string(hasher(dev_id + "|" + remote_filename + "|" + std::to_string(now)));
 }
 
-static bool find_json_string_value_range(const std::string &json, const std::string &key, size_t &value_start, size_t &value_end)
-{
-    const std::string needle = "\"" + key + "\": \"";
-    const size_t key_pos = json.find(needle);
-    if (key_pos == std::string::npos) {
-        return false;
-    }
-
-    value_start = key_pos + needle.size();
-    value_end = value_start;
-    bool escaped = false;
-    while (value_end < json.size()) {
-        const char c = json[value_end];
-        if (!escaped && c == '"') {
-            return true;
-        }
-        if (!escaped && c == '\\') {
-            escaped = true;
-        } else {
-            escaped = false;
-        }
-        value_end++;
-    }
-    return false;
-}
-
-static std::string json_string_field(const std::string &json, const std::string &key)
-{
-    size_t value_start = 0;
-    size_t value_end = 0;
-    if (!find_json_string_value_range(json, key, value_start, value_end)) {
-        return "";
-    }
-    return json.substr(value_start, value_end - value_start);
-}
-
 static void update_local_print_context(
     const BBL::PrintParams &params,
     const std::string &remote_filename,
@@ -291,51 +255,6 @@ static std::string rewrite_local_print_status_message(const std::string &device_
     return local_print_context_store.rewrite_status_message(device_id, message);
 }
 
-static std::string apply_printer_name_override(const std::string &json)
-{
-    const std::string dev_id = json_string_field(json, "dev_id");
-    if (dev_id.empty()) {
-        return json;
-    }
-
-    std::string override_name;
-    {
-        std::lock_guard<std::mutex> lock(printer_name_overrides_mutex);
-        const auto it = printer_name_overrides.find(dev_id);
-        if (it == printer_name_overrides.end() || it->second.empty()) {
-            return json;
-        }
-        override_name = it->second;
-    }
-
-    size_t value_start = 0;
-    size_t value_end = 0;
-    if (!find_json_string_value_range(json, "dev_name", value_start, value_end)) {
-        return json;
-    }
-
-    std::string rewritten = json;
-    rewritten.replace(value_start, value_end - value_start, BambuPlugin::json_escape(override_name));
-    return rewritten;
-}
-
-static void persist_printer_name_overrides()
-{
-    std::unordered_map<std::string, std::string> snapshot;
-    std::lock_guard<std::mutex> lock(printer_name_overrides_mutex);
-    snapshot = printer_name_overrides;
-    BambuPlugin::persist_printer_name_overrides(config_dir_path, snapshot, write_diag);
-}
-
-static void load_printer_name_overrides()
-{
-    auto loaded = BambuPlugin::load_printer_name_overrides(config_dir_path, write_diag);
-    {
-        std::lock_guard<std::mutex> lock(printer_name_overrides_mutex);
-        printer_name_overrides = std::move(loaded);
-    }
-}
-
 static void persist_selected_device()
 {
     BambuPlugin::persist_selected_device(config_dir_path, session_state.selected_device(), write_diag);
@@ -353,12 +272,7 @@ static void load_selected_device()
 
 static bool printer_json_matches_selected_device(const std::string &json)
 {
-    const std::string selected_device = session_state.selected_device();
-    if (selected_device.empty()) {
-        return false;
-    }
-    const std::string needle = "\"dev_id\": \"" + selected_device + "\"";
-    return json.find(needle) != std::string::npos;
+    return printer_metadata_store.json_matches_device(json, session_state.selected_device());
 }
 
 static void connect_selected_device_if_pending(const std::string &json)
@@ -367,7 +281,7 @@ static void connect_selected_device_if_pending(const std::string &json)
         return;
     }
 
-    const std::string target = session_state.claim_autoconnect_target(json_string_field(json, "dev_id"));
+    const std::string target = session_state.claim_autoconnect_target(BambuPlugin::json_string_field(json, "dev_id"));
     if (target.empty()) {
         return;
     }
@@ -913,8 +827,8 @@ void Bambu_FreeLogMsg(tchar const *msg)
 }
 
 void bambu_network_cb_printer_available(const std::string &json) {
-    const std::string effective_json = apply_printer_name_override(json);
-    const std::string dev_id = json_string_field(effective_json, "dev_id");
+    const std::string effective_json = printer_metadata_store.apply_name_override(json);
+    const std::string dev_id = BambuPlugin::json_string_field(effective_json, "dev_id");
     write_diag(
         "bambu_network_cb_printer_available: dev_id=" + dev_id +
         " preview=\"" + preview_payload(effective_json, 512) + "\""
@@ -1003,7 +917,7 @@ int bambu_network_set_config_dir(void *agent_ptr, std::string config_dir)
     write_diag("bambu_network_set_config_dir: " + config_dir);
     config_dir_path = config_dir;
     load_selected_device();
-    load_printer_name_overrides();
+    printer_metadata_store.load(config_dir_path, write_diag);
     local_print_context_store.load(config_dir_path, write_diag);
     return 0;
 }
@@ -1392,21 +1306,13 @@ int bambu_network_modify_printer_name(void *agent_ptr, std::string dev_id, std::
         "bambu_network_modify_printer_name: dev_id=" + dev_id +
         " dev_name=" + dev_name
     );
-    {
-        std::lock_guard<std::mutex> lock(printer_name_overrides_mutex);
-        if (dev_name.empty()) {
-            printer_name_overrides.erase(dev_id);
-        } else {
-            printer_name_overrides[dev_id] = dev_name;
-        }
-    }
-    persist_printer_name_overrides();
+    printer_metadata_store.set_name_override(dev_id, dev_name, config_dir_path, write_diag);
 
     std::string last_json;
     std::string updated_json;
     last_json = callback_registry.printer_json(dev_id);
     if (!last_json.empty()) {
-        updated_json = apply_printer_name_override(last_json);
+        updated_json = printer_metadata_store.apply_name_override(last_json);
         callback_registry.remember_printer_json(dev_id, updated_json);
     }
     if (!updated_json.empty()) {
