@@ -1,8 +1,12 @@
 endpoint = "127.0.0.1:47403"
 
 printers = [
-    # `host`, `name`, and `model` are optional. If omitted, the server will
+    # `host`, `name`, `model`, and `password` are optional. If omitted, the server will
     # scan local private IPv4 ranges and try to rediscover the printer by
     # `dev_id` over MQTT, then infer display metadata from the probe response.
-    { "dev_id" = "01234567", "password" = "abcdefgh" }
+    #
+    # If `password` is omitted, the printer can still be connected manually
+    # from Studio when the UI prompts for the LAN access code, but startup
+    # autoconnect will not work until a password is supplied for that session.
+    { "dev_id" = "01234567" }
 ]

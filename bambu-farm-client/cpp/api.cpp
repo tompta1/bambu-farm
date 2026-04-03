@@ -125,7 +125,7 @@ static void connect_selected_device_if_pending(const std::string &json)
     }
     write_diag("connect_selected_device_if_pending: autoconnect dev_id=" + target);
     callback_registry.dispatch_connected(target, write_diag);
-    bambu_network_rs_connect(target);
+    bambu_network_rs_connect(target, "");
 }
 
 static BambuPlugin::LoginState lan_login_state()
@@ -581,7 +581,7 @@ int bambu_network_connect_printer(void *agent_ptr, std::string dev_id, std::stri
     }
     write_diag("bambu_network_connect_printer: " + dev_id + "@" + dev_ip);
     persist_selected_device();
-    bambu_network_rs_connect(dev_id);
+    bambu_network_rs_connect(dev_id, password);
     return 0;
 }
 int bambu_network_disconnect_printer(void *agent_ptr)

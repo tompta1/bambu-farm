@@ -15,6 +15,7 @@ message PrinterOptionList {
 
 message ConnectRequest {
     string dev_id = 1;
+    string password = 2;
 }
 
 message RecvMessage {

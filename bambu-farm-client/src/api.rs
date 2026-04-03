@@ -159,7 +159,7 @@ mod ffi {
         pub fn bambu_network_rs_init();
         pub fn bambu_network_rs_log_debug(message: String);
         pub fn bambu_network_rs_refresh_available_printers();
-        pub fn bambu_network_rs_connect(device_id: String) -> i32;
+        pub fn bambu_network_rs_connect(device_id: String, password: String) -> i32;
         pub fn bambu_network_rs_disconnect(device_id: String) -> i32;
         pub fn bambu_network_rs_send(device_id: String, data: String) -> i32;
         pub fn bambu_network_rs_upload_file(
@@ -720,7 +720,7 @@ pub fn bambu_network_rs_init() {
                 }
             };
             if let Some(printer) = CURRENT_CONNECTED_PRINTER.lock().unwrap().as_ref() {
-                bambu_network_rs_connect(printer.clone());
+                bambu_network_rs_connect(printer.clone(), String::new());
             }
             let mut failures = 0u32;
             loop {
@@ -757,7 +757,7 @@ pub fn bambu_network_rs_log_debug(message: String) {
     debug!("cxx: {}", message);
 }
 
-pub fn bambu_network_rs_connect(device_id: String) -> i32 {
+pub fn bambu_network_rs_connect(device_id: String, password: String) -> i32 {
     debug!("Attempting connection.");
 
     disconnect_active_connection();
@@ -788,6 +788,7 @@ pub fn bambu_network_rs_connect(device_id: String) -> i32 {
 
         let request = Request::new(ConnectRequest {
             dev_id: device_id.clone(),
+            password,
         });
         let mut stream = match client.connect_printer(request).await {
             Ok(stream) => stream.into_inner(),

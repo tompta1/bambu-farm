@@ -191,6 +191,10 @@ fn discovery_match_from_payload(candidate_ip: Ipv4Addr, payload: &str) -> Discov
 }
 
 fn probe_printer_identity(printer: &Printer, candidate_ip: Ipv4Addr) -> Option<DiscoveryMatch> {
+    if printer.password.trim().is_empty() {
+        return None;
+    }
+
     let server_uri = format!("mqtts://{}:8883", candidate_ip);
     let client_id = format!("bambu-farm-discovery-{}-{}", printer.id, candidate_ip);
     let cli = match Client::new(
@@ -651,6 +655,36 @@ impl Farm {
         }
     }
 
+    fn update_printer_password(&self, dev_id: &str, password: &str) {
+        if password.trim().is_empty() {
+            return;
+        }
+
+        if let Ok(mut printers) = self.printers.lock() {
+            if let Some(printer) = printers.iter_mut().find(|printer| printer.id == dev_id) {
+                printer.password = password.to_string();
+            }
+        }
+    }
+
+    fn resolve_connect_password(
+        &self,
+        printer: &Printer,
+        request: &ConnectRequest,
+    ) -> Result<String, Status> {
+        let password = if request.password.trim().is_empty() {
+            printer.password.trim()
+        } else {
+            request.password.trim()
+        };
+
+        if password.is_empty() {
+            return Err(Status::invalid_argument("Missing printer password"));
+        }
+
+        Ok(password.to_string())
+    }
+
     async fn refresh_discovery_metadata(&self) {
         let printers = match self.printers.lock() {
             Ok(printers) => printers.clone(),
@@ -659,6 +693,9 @@ impl Farm {
 
         for printer in printers {
             if !printer.ip.trim().is_empty() && !printer.name.trim().is_empty() && !printer.model.trim().is_empty() {
+                continue;
+            }
+            if printer.password.trim().is_empty() {
                 continue;
             }
 
@@ -882,7 +919,11 @@ impl BambuFarm for Farm {
         &self,
         request: Request<ConnectRequest>,
     ) -> Result<Response<Self::ConnectPrinterStream>, Status> {
-        let printer = self.lookup_printer(&request.get_ref().dev_id)?;
+        let request_inner = request.get_ref().clone();
+        let mut printer = self.lookup_printer(&request_inner.dev_id)?;
+        let password = self.resolve_connect_password(&printer, &request_inner)?;
+        printer.password = password.clone();
+        self.update_printer_password(&printer.id, &password);
         let printer = self.resolve_printer_for_connect(printer).await?;
 
         match self.connect_printer_session(&printer, &request).await {
@@ -1045,19 +1086,17 @@ fn construct_printer(config: Value) -> Option<Printer> {
         .get("host")
         .map(|host| host.to_string())
         .unwrap_or_default();
-    let password = if let Some(password) = printer.get("password") {
-        password
-    } else {
-        eprintln!("Missing `password` in printer config.");
-        return None;
-    };
+    let password = printer
+        .get("password")
+        .map(ToString::to_string)
+        .unwrap_or_default();
     let name = printer.get("name").map(ToString::to_string).unwrap_or_default();
     Some(Printer {
         name,
         id: dev_id.to_string(),
         ip: host,
         model: model.to_string(),
-        password: password.to_string(),
+        password,
     })
 }
 
@@ -1261,6 +1300,16 @@ mod tests {
         assert_eq!(printer.model, "");
         assert_eq!(printer.password, "secret");
         assert!(printer.ip.is_empty());
+    }
+
+    #[test]
+    fn construct_printer_allows_missing_password() {
+        let mut config = test_printer_config(None).into_table().expect("printer table");
+        config.remove("password");
+
+        let printer = construct_printer(Value::from(config)).expect("printer config");
+
+        assert!(printer.password.is_empty());
     }
 
     #[test]
